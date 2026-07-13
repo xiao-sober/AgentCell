@@ -117,6 +117,239 @@ class ProviderProtocolError(ProviderError):
     code = "provider_protocol_error"
 
 
+class AgentRegistrationError(ConfigurationError):
+    """Raised for duplicate or internally inconsistent Agent declarations."""
+
+    code = "agent_registration_error"
+
+
+class AgentNotFoundError(ConfigurationError):
+    """Raised when a stable Agent identifier is not registered."""
+
+    code = "agent_not_found"
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(f"Agent {agent_id!r} is not registered")
+
+
+class ToolError(AgentCellError):
+    """Base class for safe, classified tool-system failures."""
+
+    code = "tool_error"
+
+
+class ToolRegistrationError(ToolError):
+    """Raised when a ToolRegistry definition is invalid or duplicated."""
+
+    code = "tool_registration_error"
+
+
+class ToolNotFoundError(ToolError):
+    """Raised when a requested tool name is not registered."""
+
+    code = "tool_not_found"
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name!r} is not registered")
+
+
+class ToolArgumentsError(ToolError):
+    """Raised when structured tool arguments fail schema validation."""
+
+    code = "tool_arguments_invalid"
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name!r} received invalid arguments")
+
+
+class CapabilityDeniedError(ToolError):
+    """Raised when a Run lease does not grant a required capability."""
+
+    code = "capability_denied"
+
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+        super().__init__(f"Capability {capability!r} is not granted")
+
+
+class CapabilityEscalationError(ToolError):
+    """Raised when a child lease would exceed its parent's authority."""
+
+    code = "capability_escalation"
+
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+        super().__init__(f"Child lease expands capability {capability!r}")
+
+
+class ToolApprovalRequiredError(ToolError):
+    """Raised when a guarded or dangerous tool lacks explicit approval."""
+
+    code = "tool_approval_required"
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name!r} requires approval")
+
+
+class ToolForbiddenError(ToolError):
+    """Raised when policy marks a tool as unconditionally forbidden."""
+
+    code = "tool_forbidden"
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name!r} is forbidden")
+
+
+class ToolTimeoutError(ToolError):
+    """Raised when a tool exceeds its declared execution timeout."""
+
+    code = "tool_timeout"
+
+    def __init__(self, tool_name: str, timeout_seconds: float) -> None:
+        self.tool_name = tool_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"Tool {tool_name!r} exceeded its {timeout_seconds:g}s timeout")
+
+
+class ToolExecutionError(ToolError):
+    """Raised when tool implementation code fails unexpectedly."""
+
+    code = "tool_execution_error"
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name!r} failed during execution")
+
+
+class ToolOutputTooLargeError(ToolError):
+    """Raised when oversized output has no Artifact Store destination."""
+
+    code = "tool_output_too_large"
+
+    def __init__(self, tool_name: str, actual_bytes: int, max_bytes: int) -> None:
+        self.tool_name = tool_name
+        self.actual_bytes = actual_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"Tool {tool_name!r} output is {actual_bytes} bytes; limit is {max_bytes} bytes"
+        )
+
+
+class WorkspacePathError(ToolError):
+    """Base class for workspace path and content safety failures."""
+
+    code = "workspace_path_error"
+
+
+class WorkspacePathDeniedError(WorkspacePathError):
+    """Raised for absolute, escaping, sensitive, or unleased paths."""
+
+    code = "workspace_path_denied"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Workspace path denied: {reason}")
+
+
+class WorkspacePathNotFoundError(WorkspacePathError):
+    """Raised when an allowed workspace path does not exist."""
+
+    code = "workspace_path_not_found"
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(f"Workspace path {path!r} was not found")
+
+
+class WorkspacePathTypeError(WorkspacePathError):
+    """Raised when a file operation receives a directory or vice versa."""
+
+    code = "workspace_path_type_error"
+
+    def __init__(self, path: str, expected: str) -> None:
+        self.path = path
+        self.expected = expected
+        super().__init__(f"Workspace path {path!r} must be a {expected}")
+
+
+class WorkspaceBinaryFileError(WorkspacePathError):
+    """Raised when a text-only workspace tool encounters binary content."""
+
+    code = "workspace_binary_file"
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(f"Workspace path {path!r} is not a UTF-8 text file")
+
+
+class WorkspacePatchConflictError(WorkspacePathError):
+    """Raised when a structured patch no longer matches the expected file state."""
+
+    code = "workspace_patch_conflict"
+
+    def __init__(self, path: str, expected: int, actual: int) -> None:
+        self.path = path
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Workspace patch for {path!r} expected {expected} matches but found {actual}"
+        )
+
+
+class WorkspaceStateConflictError(WorkspacePathError):
+    """Raised when a file changed after the state used to prepare approval."""
+
+    code = "workspace_state_conflict"
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"Workspace file {path!r} changed since it was read or approved")
+
+
+class ShellError(ToolError):
+    """Base class for bounded subprocess execution failures."""
+
+    code = "shell_error"
+
+
+class ShellCommandDeniedError(ShellError):
+    code = "shell_command_denied"
+
+    def __init__(self, command: str) -> None:
+        super().__init__(f"Shell command {command!r} is not granted by the Run lease")
+
+
+class ShellOutputTooLargeError(ShellError):
+    code = "shell_output_too_large"
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"Shell output exceeded the {max_bytes} byte capture limit")
+
+
+class HttpToolError(ToolError):
+    """Base class for bounded outbound HTTP failures."""
+
+    code = "http_tool_error"
+
+
+class HttpRequestDeniedError(HttpToolError):
+    code = "http_request_denied"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"HTTP request denied: {reason}")
+
+
+class HttpResponseTooLargeError(HttpToolError):
+    code = "http_response_too_large"
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"HTTP response exceeded the {max_bytes} byte limit")
+
+
 class DomainError(AgentCellError):
     """Base class for invalid domain operations."""
 
@@ -141,6 +374,92 @@ class InvalidRunTimestampError(DomainError):
 
     def __init__(self) -> None:
         super().__init__("Run updated_at cannot be earlier than its current value")
+
+
+class RunExecutionError(AgentCellError):
+    """Raised when a Run fails outside an already classified boundary."""
+
+    code = "run_execution_error"
+
+    def __init__(self, message: str = "Run execution failed") -> None:
+        super().__init__(message)
+
+
+class ApprovalError(DomainError):
+    """Base class for persisted approval workflow failures."""
+
+    code = "approval_error"
+
+
+class ApprovalNotFoundError(ApprovalError):
+    """Raised when an approval identifier is unknown."""
+
+    code = "approval_not_found"
+
+    def __init__(self, approval_id: str) -> None:
+        super().__init__(f"Approval {approval_id!r} was not found")
+
+
+class ApprovalConflictError(ApprovalError):
+    """Raised when a decision conflicts with persisted approval state."""
+
+    code = "approval_conflict"
+
+
+class ReplayError(DomainError):
+    """Raised when an event stream cannot be replayed deterministically."""
+
+    code = "replay_error"
+
+
+class ToolReplayBlockedError(ToolError):
+    """Raised when an ambiguous non-idempotent execution cannot be repeated safely."""
+
+    code = "tool_replay_blocked"
+
+    def __init__(self, tool_name: str, provider_call_id: str) -> None:
+        super().__init__(
+            f"Non-idempotent tool {tool_name!r} call {provider_call_id!r} cannot be replayed"
+        )
+
+
+class ArtifactError(AgentCellError):
+    """Base class for bounded Artifact persistence failures."""
+
+    code = "artifact_error"
+
+
+class ArtifactNotFoundError(ArtifactError):
+    code = "artifact_not_found"
+
+    def __init__(self, artifact_id: str) -> None:
+        super().__init__(f"Artifact {artifact_id!r} was not found")
+
+
+class ArtifactIntegrityError(ArtifactError):
+    code = "artifact_integrity_error"
+
+
+class ArtifactTooLargeError(ArtifactError):
+    code = "artifact_too_large"
+
+
+class MemoryError(AgentCellError):
+    """Base class for memory policy, storage, and retrieval failures."""
+
+    code = "memory_error"
+
+
+class MemoryNotFoundError(MemoryError):
+    code = "memory_not_found"
+
+
+class MemoryApprovalRequiredError(MemoryError):
+    code = "memory_approval_required"
+
+
+class MemoryPolicyRejectedError(MemoryError):
+    code = "memory_policy_rejected"
 
 
 class BudgetError(DomainError):
@@ -203,6 +522,15 @@ class StorageError(AgentCellError):
     """Base class for classified persistence failures."""
 
     code = "storage_error"
+
+
+class CheckpointNotFoundError(StorageError):
+    """Raised when a Run has no recoverable checkpoint."""
+
+    code = "checkpoint_not_found"
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"Run {run_id!r} has no recoverable checkpoint")
 
 
 class StorageIntegrityError(StorageError):

@@ -259,6 +259,21 @@ flowchart TD
 - 网络默认 HTTPS 白名单，禁止云元数据地址和本机敏感端口；
 - 删除和危险命令必须审批或拒绝。
 
+### 当前状态
+
+阶段 4 已于 2026-07-13 完成：RiskLevel、Capability、ToolPolicy、CapabilityLease、父子租约缩权、PolicyEngine、ToolRegistry 和统一 ToolExecutor 均已实现。`workspace.list/read/search` 已形成参数校验、默认拒绝、租约范围、预算预留、事件 Sink、超时、输出字节上限和 Artifact 转存的完整安全路径。临时工作区测试覆盖盘符/UNC/父目录穿越、敏感文件、租约越界、Windows junction 逃逸、二进制文件、UTF-8 分块、有限搜索、超时、异常脱敏和非幂等工具不重试。Shell、网络、写入和删除工具仍未注册，下一步进入阶段 5。
+
+### 危险工具的后续归属
+
+阶段 4 实施顺序中的“最后再加入 `workspace.write/patch/delete`、Shell、HTTP 和其他工具”不表示这些能力应在只读安全切片中直接开放。它们必须等依赖的安全基础完成后再统一实现：
+
+- 阶段 5 保持只读，只验证 RunService、Fake Provider、EventStore、预算和首批安全工具的 M1 闭环；
+- 阶段 6 先完成审批持久化、参数修改审批、检查点、暂停恢复和非幂等操作防重放；
+- 阶段 7 先完成 Artifact Store，让大型 Diff、命令输出和 HTTP 响应能够外置、恢复和安全引用；
+- 随后进入“阶段 7.1：生产工具扩展”，再实现写入、删除、Shell 和 HTTP 工具。
+
+不得为了让阶段 5 功能看起来完整而使用临时布尔值、绕过审批、无限内存输出或无恢复语义的方式提前开放危险工具。
+
 ## 阶段 5：RunService 与首个 M1 端到端闭环
 
 ### 目标
@@ -288,6 +303,12 @@ flowchart TD
 - `agentcell run` 可用 Fake Provider 离线完成任务；
 - Run 的每个终态都有对应最终事件；
 - M1 最小闭环可在进程内重复测试且结果确定。
+
+### 完成情况（2026-07-13）
+
+阶段 5 已完成。当前已实现无状态 `AgentSpec`、`AgentRegistry`、`AgentFactory`、Run 级依赖注入、EventStore 事件 Sink、PydanticAI 模型与工具循环、模型文本增量、预算记账，以及 `completed`、`failed`、`cancelled` 终态。`agentcell run --offline-fake` 可直接调用 RunService 离线执行，支持 `--json`；Ctrl+C 通过任务取消语义进入 `run.cancelled`。集成测试覆盖无工具文本、单次/多次只读工具、Provider 失败、工具失败、请求预算超限、取消和 CLI 持久化。
+
+阶段 5 仍严格保持只读。审批持久化、检查点、恢复、回放和分支属于阶段 6；Artifact Store 属于阶段 7；写入、删除、Shell 和 HTTP 属于阶段 7.1。
 
 ## 阶段 6：审批、检查点、恢复、回放与分支
 
@@ -319,6 +340,12 @@ flowchart TD
 - 检查点内容足以恢复，不依赖进程内对象；
 - 永久全局批准不作为默认能力。
 
+### 完成情况（2026-07-13）
+
+阶段 6 已完成。审批使用 PydanticAI 原生 `DeferredToolRequests/DeferredToolResults`；`approvals`、`checkpoints` 和 `tool_executions` 由 Alembic revision `20260713_0002` 创建。RunService 支持审批暂停、进程重启后批准/拒绝/修改参数恢复、当前 Run 临时同类批准、幂等取消和重复恢复冲突检测。ReplayService 支持完整/前缀回放与检查点支持的指定 sequence 分支；持久化工具执行账本阻止已开始的非幂等调用在恢复时重复执行。
+
+测试覆盖审批展示字段、重启恢复、三类决定、同类临时授权、重复恢复、回放一致性、分支来源边界和非幂等防重放。阶段 6 没有注册任何写入、删除、Shell 或 HTTP 工具；下一步进入阶段 7 的记忆、上下文压缩与 Artifact。
+
 ## 阶段 7：记忆、上下文压缩与 Artifact
 
 ### 目标
@@ -342,6 +369,58 @@ flowchart TD
 - 工具调用/结果配对裁剪；
 - 大输出转 Artifact 后可恢复加载；
 - 压缩前后关键任务状态不丢失。
+
+### 完成情况（2026-07-13）
+
+阶段 7 已完成。新增 Working、Conversation、Episodic、Semantic 四层领域模型和作用域安全的 `MemoryService`；Alembic revision `20260713_0003` 创建 `memory_items`、`memory_fts`、同步触发器及 `artifacts`。检索综合 FTS5 BM25、30 天半衰期、重要度、标签和用户/项目/Agent 作用域，写入经过凭据拒绝、Semantic 显式批准、去重和过期策略。
+
+运行时已接入 `MemoryInjector → PairSafeTrimmer → ToolOutputCompactor`，召回和压缩形成领域事件；`EpisodicSummarizer` 强制使用独立、低温度、关闭深度思考的模型配置。文件 Artifact Store 提供大小上限、受控路径、原子写入、内容去重、SHA-256/字节数加载校验，并把消息中的 Artifact UUID 保存进检查点。测试覆盖检索排序与隔离、CRUD/过期/策略、成对裁剪、运行时召回事件、大输出外置、篡改检测及进程重启后恢复加载。
+
+阶段 7 仍未注册写入、删除、Shell 或 HTTP 工具；下一步进入阶段 7.1 的生产工具扩展。
+
+## 阶段 7.1：生产工具扩展
+
+### 前置条件
+
+只有同时满足以下条件才开始本阶段：
+
+- 阶段 6 的审批、检查点、暂停恢复和非幂等防重放测试已经通过；
+- 阶段 7 的 Artifact Store 已可持久化、加载、校验哈希并随检查点恢复；
+- ToolExecutor 仍是参数、能力、预算、事件、超时和输出限制的唯一执行入口。
+
+### 实施内容
+
+1. 实现 `workspace.write` 和 `workspace.patch`：写入前生成 Diff，使用工作区路径与 `filesystem.write` 租约校验，并默认要求审批；
+2. 实现 `workspace.delete`：标记为 DANGEROUS 和非幂等，必须审批，恢复时不得重复删除；
+3. 实现 `shell.run/test`：默认关闭，只接受参数数组和命令白名单，限制 cwd、环境变量、超时和输出大小，禁止 `shell=True`；
+4. 实现 `http.request`：只允许 HTTPS 白名单，DNS 解析后的所有地址必须再次检查，重定向逐跳复核，禁止本机、私网、链路本地和云元数据地址；
+5. 对 POST、PUT、PATCH、DELETE 等非只读 HTTP 方法默认要求审批，并禁止非幂等自动重试；
+6. 将大型 Diff、Shell 输出和 HTTP 响应写入 Artifact，事件和模型上下文只保留摘要与引用；
+7. 为每次危险操作保存审批关联、参数摘要、能力租约、预算、事件和检查点信息。
+
+### 必测内容
+
+- 写入和补丁的路径穿越、symlink/junction 逃逸、敏感路径和审批 Diff；
+- 删除批准、拒绝、取消、恢复和非幂等防重放；
+- Shell 参数注入、命令白名单、环境泄漏、超时、输出超限和 Ctrl+C；
+- HTTP DNS rebinding、重定向绕过、IPv4/IPv6 私网、元数据地址、响应超限和非只读审批；
+- 大输出转 Artifact 后能够恢复加载，且事件、日志和模型上下文不包含完整敏感内容；
+- 子 Agent 不能通过生产工具扩大父 Run 的文件、命令或网络权限。
+
+### 验收门槛
+
+- 不存在绕过 ToolExecutor、CapabilityLease 或审批服务的生产工具调用路径；
+- 写入、删除、Shell 和非只读网络操作在未获得有效审批时无法执行；
+- 进程重启恢复不会重复执行已经完成的非幂等操作；
+- Shell 仍明确属于进程级约束，不宣称具备强沙箱隔离。
+
+### 完成情况（2026-07-13）
+
+阶段 7.1 已完成。`workspace.write/patch/delete` 使用统一路径解析、读写双作用域、敏感路径拒绝、symlink/junction 防护、审批前 unified Diff、`expected_sha256` 并发保护和原子写入；删除保持 DANGEROUS、非幂等且受持久化执行账本保护。大型 Diff 保存为 Artifact，并将引用纳入审批和检查点。
+
+`shell.run/test` 只接受命令名和参数数组，使用清洗后的绝对 PATH 解析、工作区 cwd、环境白名单、进程超时和合并输出上限，不使用 `shell=True`；两者均按非幂等危险工具处理。`http.request` 只允许经过租约批准的 HTTPS 443，逐跳检查域名、全部 DNS 地址、固定连接 IP、Host/TLS SNI、真实 peer、重定向、请求头、敏感 query、请求/响应大小，并禁用环境代理。当前对所有 HTTP 方法采取更严格的逐次审批和非幂等策略。
+
+测试覆盖批准前不执行、Diff 重启恢复、哈希冲突、创建/补丁/删除、junction 逃逸、命令白名单、argv 注入、环境泄漏、输出超限/Artifact、私网 DNS、DNS 固定、子域重定向、敏感参数、响应上限和大型 Diff 检查点引用。下一步进入阶段 8 的多 Agent 协作与预算继承。
 
 ## 阶段 8：多 Agent 协作与预算继承
 

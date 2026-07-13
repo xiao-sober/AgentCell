@@ -95,7 +95,7 @@ uv run python -m pytest
 
 | 技术 | 当前状态 | 在 AgentCell 中的作用 | 使用边界 | 官方资料 |
 | --- | --- | --- | --- | --- |
-| SQLite | 已接入 | 首版唯一数据库文件，保存 Runs、领域事件、消息、审批、记忆、Artifacts 和检查点；未来使用 FTS5 完成长记忆检索。 | 保持单机单文件；启用 WAL、外键和 busy timeout；不把它包装成伪分布式数据库。大型二进制内容优先外置为 Artifact。 | [SQLite 文档](https://www.sqlite.org/docs.html) |
+| SQLite | 已接入 | 首版唯一数据库文件，保存 Runs、领域事件、审批、记忆、Artifacts 和检查点；使用 FTS5、BM25 和作用域过滤完成长期记忆检索。 | 保持单机单文件；启用 WAL、外键和 busy timeout；不把它包装成伪分布式数据库。大型内容外置为文件 Artifact，SQLite 只保存元数据。 | [SQLite 文档](https://www.sqlite.org/docs.html) |
 | SQLAlchemy 2 | 已接入 | 提供异步 Engine/Session、事务、SQL 表达式和 ORM 映射，隔离业务层与 SQLite 实现。 | storage 返回领域模型；ORM 实例不得进入 kernel、API 或前端 DTO；AsyncSession 不在并发任务间共享。 | [SQLAlchemy asyncio](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html) |
 | Alembic | 已接入 | 维护可审查、可升级和可降级的数据库 Schema 历史，并检查 ORM metadata 与迁移是否漂移。 | 所有生产 Schema 变更必须通过迁移；应用启动不得调用 `metadata.create_all()` 临时改变生产表。 | [Alembic 文档](https://alembic.sqlalchemy.org/en/latest/) |
 | aiosqlite | 已接入 | 为 SQLAlchemy 的 SQLite 方言提供 asyncio 驱动，使数据库调用不阻塞 AgentCell 的事件循环。 | 它不改变 SQLite 的单写者特性；并发正确性仍依赖事务、WAL、busy timeout、唯一约束和重试边界。 | [aiosqlite 文档](https://aiosqlite.omnilib.dev/en/stable/) |

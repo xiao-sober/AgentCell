@@ -40,7 +40,7 @@ async def _append_generic_event(
     async with database.transaction() as session:
         event = await EventStore(session).append(
             run_id=run_id,
-            event_type=EventType.RUN_STARTED,
+            event_type=EventType.MEMORY_RECALLED,
             payload=GenericEventPayload(data={"index": index}),
         )
     return event.sequence
@@ -55,7 +55,7 @@ async def test_event_store_round_trips_typed_payloads_and_cursor_queries(
         store = EventStore(session)
         first = await store.append(
             run_id=run.id,
-            event_type=EventType.RUN_STARTED,
+            event_type=EventType.MEMORY_RECALLED,
             payload=GenericEventPayload(
                 data={"agent_id": run.agent_id, "api_key": "must-not-persist"}
             ),
@@ -122,7 +122,7 @@ async def test_event_append_and_sequence_allocation_roll_back_together(
         async with database.transaction() as session:
             await EventStore(session).append(
                 run_id=run.id,
-                event_type=EventType.RUN_STARTED,
+                event_type=EventType.MEMORY_RECALLED,
                 payload=GenericEventPayload(),
             )
             raise RuntimeError("rollback event")
@@ -141,7 +141,7 @@ async def test_event_store_rejects_wrong_payload_invalid_cursor_and_unknown_run(
         async with database.transaction() as session:
             await EventStore(session).append(
                 run_id=run.id,
-                event_type=EventType.RUN_STARTED,
+                event_type=EventType.MEMORY_RECALLED,
                 payload=TextDeltaPayload(delta="wrong schema"),
             )
 
@@ -153,7 +153,7 @@ async def test_event_store_rejects_wrong_payload_invalid_cursor_and_unknown_run(
         async with database.transaction() as session:
             await EventStore(session).append(
                 run_id=uuid4(),
-                event_type=EventType.RUN_STARTED,
+                event_type=EventType.MEMORY_RECALLED,
                 payload=GenericEventPayload(),
             )
 
@@ -194,7 +194,7 @@ async def test_oversized_inline_payload_is_rejected_without_consuming_sequence(
         async with database.transaction() as session:
             await EventStore(session).append(
                 run_id=run.id,
-                event_type=EventType.RUN_STARTED,
+                event_type=EventType.MEMORY_RECALLED,
                 payload=GenericEventPayload(data={"output": "x" * 70_000}),
             )
 

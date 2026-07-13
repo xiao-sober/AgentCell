@@ -20,6 +20,28 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+_FTS5_TABLES = {
+    "memory_fts",
+    "memory_fts_config",
+    "memory_fts_content",
+    "memory_fts_data",
+    "memory_fts_docsize",
+    "memory_fts_idx",
+}
+
+
+def _include_object(
+    object_: object,
+    name: str | None,
+    type_: str,
+    reflected: bool,
+    compare_to: object,
+) -> bool:
+    """Ignore only the FTS5 virtual table and its SQLite-managed shadow tables."""
+
+    del object_, compare_to
+    return not (type_ == "table" and reflected and name in _FTS5_TABLES)
+
 
 def _database_url() -> str:
     url = os.getenv("AGENTCELL_DATABASE_URL") or config.get_main_option("sqlalchemy.url")
@@ -39,6 +61,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         render_as_batch=True,
         compare_type=True,
+        include_object=_include_object,
     )
 
     with context.begin_transaction():
@@ -51,6 +74,7 @@ def _run_migrations(connection: Connection) -> None:
         target_metadata=target_metadata,
         render_as_batch=connection.dialect.name == "sqlite",
         compare_type=True,
+        include_object=_include_object,
     )
 
     with context.begin_transaction():

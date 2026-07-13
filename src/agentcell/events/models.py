@@ -128,6 +128,50 @@ class ErrorPayload(EventPayload):
         return cast(dict[str, JsonValue], redact_sensitive_data(value))
 
 
+class RunStartedPayload(EventPayload):
+    """Initial identity recorded when a Run is created."""
+
+    conversation_id: UUID
+    agent_id: str = Field(min_length=1)
+
+
+class RunStatusChangedPayload(EventPayload):
+    """One validated lifecycle transition without depending on kernel enums."""
+
+    previous_status: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+
+
+class ModelRequestedPayload(EventPayload):
+    """Sanitized identity for one budget-reserved model request."""
+
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    request_index: int = Field(ge=1, strict=True)
+
+
+class ModelCompletedPayload(EventPayload):
+    """Normalized usage for one completed model request."""
+
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    request_index: int = Field(ge=1, strict=True)
+    input_tokens: int = Field(ge=0, strict=True)
+    output_tokens: int = Field(ge=0, strict=True)
+    cache_write_tokens: int = Field(default=0, ge=0, strict=True)
+    cache_read_tokens: int = Field(default=0, ge=0, strict=True)
+
+
+class RunCompletedPayload(EventPayload):
+    """Terminal output metadata kept small enough for the event stream."""
+
+    output_characters: int = Field(ge=0, strict=True)
+    requests: int = Field(ge=0, strict=True)
+    input_tokens: int = Field(ge=0, strict=True)
+    output_tokens: int = Field(ge=0, strict=True)
+    tool_calls: int = Field(ge=0, strict=True)
+
+
 class ArtifactReference(BaseModel):
     """Stable reference embedded in events when content is stored outside the event table."""
 
@@ -165,11 +209,16 @@ class DomainEvent[PayloadT: EventPayload](BaseModel):
 
 
 _PAYLOAD_MODELS: dict[EventType, type[EventPayload]] = {
+    EventType.RUN_STARTED: RunStartedPayload,
+    EventType.RUN_STATUS_CHANGED: RunStatusChangedPayload,
+    EventType.MODEL_REQUESTED: ModelRequestedPayload,
     EventType.MODEL_TEXT_DELTA: TextDeltaPayload,
+    EventType.MODEL_COMPLETED: ModelCompletedPayload,
     EventType.TOOL_OUTPUT_DELTA: TextDeltaPayload,
     EventType.MODEL_FAILED: ErrorPayload,
     EventType.TOOL_FAILED: ErrorPayload,
     EventType.RUN_FAILED: ErrorPayload,
+    EventType.RUN_COMPLETED: RunCompletedPayload,
 }
 
 

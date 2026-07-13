@@ -16,8 +16,13 @@ dependencies = [
     "pydantic>=2,<3",
     "pydantic-ai-slim[openai]>=2.8,<3",
     "pydantic-settings>=2.14,<3",
+    "rich>=14,<15",
     "sqlalchemy>=2,<3",
+    "typer>=0.16,<1",
 ]
+
+[project.scripts]
+agentcell = "agentcell.cli.app:main"
 
 [dependency-groups]
 dev = [

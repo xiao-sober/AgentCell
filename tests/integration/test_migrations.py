@@ -33,8 +33,24 @@ def test_initial_migration_creates_constraints_indexes_and_append_only_triggers(
     finally:
         connection.close()
 
-    assert {"alembic_version", "runs", "run_events"} <= tables
-    assert triggers == {"trg_run_events_no_update", "trg_run_events_no_delete"}
+    assert {
+        "alembic_version",
+        "runs",
+        "run_events",
+        "approvals",
+        "checkpoints",
+        "tool_executions",
+        "artifacts",
+        "memory_items",
+        "memory_fts",
+    } <= tables
+    assert {
+        "trg_run_events_no_update",
+        "trg_run_events_no_delete",
+        "trg_memory_items_fts_insert",
+        "trg_memory_items_fts_update",
+        "trg_memory_items_fts_delete",
+    } <= triggers
     assert {"ix_runs_conversation_id", "ix_runs_parent_run_id"} <= run_indexes
     assert "ix_run_events_run_occurred" in event_indexes
 
@@ -56,6 +72,12 @@ def test_initial_migration_can_downgrade_and_upgrade_again(
         connection.close()
     assert "runs" not in tables_after_downgrade
     assert "run_events" not in tables_after_downgrade
+    assert "approvals" not in tables_after_downgrade
+    assert "checkpoints" not in tables_after_downgrade
+    assert "tool_executions" not in tables_after_downgrade
+    assert "artifacts" not in tables_after_downgrade
+    assert "memory_items" not in tables_after_downgrade
+    assert "memory_fts" not in tables_after_downgrade
 
     command.upgrade(migrated_alembic_config, "head")
     connection = sqlite3.connect(database_path)
@@ -68,4 +90,17 @@ def test_initial_migration_can_downgrade_and_upgrade_again(
         }
     finally:
         connection.close()
-    assert {"runs", "run_events"} <= tables_after_upgrade
+    assert {
+        "runs",
+        "run_events",
+        "approvals",
+        "checkpoints",
+        "tool_executions",
+        "artifacts",
+        "memory_items",
+        "memory_fts",
+    } <= tables_after_upgrade
+
+
+def test_migration_metadata_has_no_drift(migrated_alembic_config: Config) -> None:
+    command.check(migrated_alembic_config)
