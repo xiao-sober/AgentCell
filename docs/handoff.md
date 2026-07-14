@@ -2,9 +2,9 @@
 
 ## 1. 当前状态
 
-更新时间：2026-07-13
+更新时间：2026-07-14
 
-项目已经完成“阶段 7.1：生产工具扩展”，下一步进入“阶段 8：多 Agent 协作与预算继承”。当前具备带 Diff 和 expected SHA-256 的工作区写入/补丁/删除、argv 白名单 Shell、DNS 固定与逐跳复核的 HTTPS 工具，以及大型 Diff/输出 Artifact 与审批检查点恢复；尚未实现子 Agent、HTTP API 或 React 应用。
+项目已经完成“阶段 9.2：CLI Agent、权限与流式执行闭环”的核心实现。当前具备 `run/chat --agent coder`、显式写路径和命令租约、request/auto/full 权限模式、完整 Diff 审批、按持久化事件 sequence 去重的 Rich 实时输出、`run --json-events` NDJSON 机器流、每轮 Run/Conversation 标识、退出续聊提示，以及带单文件/单 Run 存储额度的 ChangeSet/FileChange、before/after Artifact、Git 辅助元数据和哈希保护的显式反向变更。后续路线已经拆分为 9.2.1 正确性收口、9.2.2 CLI 产品化、9.3 确定性 software Team、10 Web MVP 和 10.1 管理补全；存储清理、高级 Git、Shell 副作用检测和独立回滚 Run 下沉到阶段 11。
 
 ## 2. 本轮已完成
 
@@ -98,18 +98,42 @@
 - 实现 `http.request`，使用 HTTPS 443、域名租约、全部 DNS 公网检查、固定 IP、Host/SNI、peer 和重定向逐跳复核；
 - 明确所有 Shell 和 HTTP 调用均审批且非幂等，禁止自动重试；
 - 新增 `docs/production-tools.md` 和生产工具安全/审批恢复集成测试。
+- 新增 coordinator、coder、只读 reviewer、researcher、summarizer 和 finalizer 内置配置；
+- 新增严格 Delegation/Handoff 领域契约和 `agent.delegate` 工具，统一经过 ToolExecutor、CapabilityLease 与预算边界；
+- 将子 Agent 真实请求、Token、工具、费用、后代数量和深度回卷父预算，墙钟持续时间不重复相加；
+- 新增 Alembic revision `20260713_0004` 和 `agent_delegations` 投影，区分真实协作关系与历史分支 lineage；
+- 使用 PydanticAI `CallDeferred/DeferredToolResults` 实现子 Agent 审批时父 Run 暂停，以及审批后先恢复子 Run、再恢复父 Run；
+- Agent as Tool 对所有子执行先建立 deferred 检查点，再启动子 Run；子终态与委派结果原子提交，执行中断时默认安全失败而不是重复执行不确定工具；
+- 新增父子专用事件 payload、稳定 trace ID 和 OpenTelemetry API Span；
+- 新增检查点式 Coordinator → Coder → Reviewer → Finalizer 程序化 Handoff；
+- Handoff 可恢复“子 Run 已终态、阶段尚未结算”的故障窗口，取消时会收敛根 Run、活动子 Run 与委派记录；
+- 新增预算结算、Agent as Tool、审批恢复、Handoff 和迁移集成测试。
+- 引入 FastAPI、Uvicorn 和 `ag-ui-protocol`，新增共享应用组合根与无全局单例的 FastAPI 工厂；
+- 实现 Runs、Approvals、Agents、Memories、Providers、Tools、Health 和 Version 资源及稳定 DTO；
+- 将领域错误统一映射为 `application/problem+json`，对不存在、冲突、越权、预算和 Provider 故障分类返回；
+- 使用官方 AG-UI 事件模型与 EventEncoder 映射模型文本、工具、Run 终态及命名 CUSTOM 领域事件；
+- 使用 `sequence.offset` SSE ID 和 `Last-Event-ID` 支持精确断线续传、终态关闭和 heartbeat；
+- 新增 revision `20260713_0005` 与 AgentSpecRepository，使 API 管理的 Agent 定义可跨重启恢复；
+- 新增 RunService 分支恢复入口，使 branch 创建的 paused Run 不再只能查看而无法继续；
+- CLI 完整提供 inspect、resume、serve、agents list、tools list 和 memory search，并保留 JSON/退出码语义；
+- 新增 API、AG-UI、CLI、分支恢复、Agent 持久化和迁移测试。
+- 将默认 Run Token 预算提高到输入 200k、输出 40k、总计 240k；CLI 新增输入/总 Token 覆盖参数，工具暴露会按剩余 Token 提前进入最终回答窗口；
+- 上下文处理新增约 32k Token 的 Provider 中立估算阈值，与 100 条消息上限、工具结果 Artifact 外置和 ToolCall/ToolReturn 成对约束共同生效。
+- 将 Provider 的缓存读取/写入 Token 聚合进 Run Usage、检查点和子 Agent 预算回卷；CLI 完成行显示输入、输出、总 Token、缓存计数和命中率，JSON 返回原始累计值。
+- DeepSeek 专用模型在非流式响应及流式最终 usage-only chunk 中把 `prompt_cache_hit_tokens` 映射为 `cache_read_tokens`；正常运行阶段的预算指令保持稳定以避免破坏缓存前缀，最终窗口在预算允许时保留最多三次输出尝试，耗尽后使用 `model_output_invalid` 明确失败。
 
 ## 3. 明确未完成
 
-- 未实现 FastAPI 路由、SSE 或 AG-UI 映射；
 - 未初始化 Vite/React 依赖和页面；
 - 未生成 `pnpm-lock.yaml`；
 - 未添加 Dockerfile 或 compose；
-- 未实现 Memory 或 delegation 工具；
-- 未实现子 Agent、预算继承或程序化 Handoff；
-- 尚未为生产工具提供完整 CLI/API 审批中心；内置 coordinator 仍默认只读；
-- 尚未把 Memory CRUD 暴露为 HTTP/完整 CLI 产品接口；当前由应用服务和运行时使用；
-- 尚未验证 AG-UI 的具体版本和事件映射。
+- 未实现 Memory 工具；
+- 尚未实现 Web 审批中心；HTTP 已支持结构化审批决定，CLI 支持批准/拒绝；
+- Memory HTTP 当前提供作用域搜索和删除，CLI 提供搜索；用户编辑/写入界面留到 Web 产品闭环；
+- `chat` 交互式 CLI 已实现；`run` 仍是稳定且无隐式历史继承的单任务入口；
+- 裸 Run 的 `conversation_id` 只承担分组与追踪，持久化 Conversation 才会自动加载已完成 Run 的有界消息历史；
+- 已完成 Run 不能通过 `resume` 追加下一轮；每次追问是同一 Conversation 下的新 Run，并有独立预算、租约和审批状态；
+- 阶段 10 应直接复用现有 Conversation 列表、消息线程和追问接口，不在前端拼接历史或复制后端冲突逻辑。
 
 这些内容被有意留给实际垂直切片，避免生成无法运行或没有测试的空实现。
 
@@ -121,7 +145,7 @@
 
 ### 4.2 生产依赖按实际切片引入
 
-`pyproject.toml` 已加入阶段 1–7.1 实际使用的 Pydantic v2、SQLAlchemy 2、Alembic、aiosqlite、PydanticAI slim、pydantic-settings、HTTPX、Typer 和 Rich。阶段 7.1 复用 HTTPX 和标准库进程/网络能力，没有新增生产依赖；FastAPI 等后续依赖仍应在首次使用时通过 `uv add` 引入。
+`pyproject.toml` 已加入阶段 1–9 实际使用的 Pydantic v2、SQLAlchemy 2、Alembic、aiosqlite、PydanticAI slim、pydantic-settings、HTTPX、OpenTelemetry API、FastAPI、Uvicorn、`ag-ui-protocol`、Typer 和 Rich。阶段 8 只接入无导出器依赖的 Trace API；SDK、Exporter 和采样配置留在可观测性阶段。
 
 ### 4.3 先做离线闭环
 
@@ -225,6 +249,7 @@ G:\AgentCell
 │   ├── config.py
 │   ├── errors.py
 │   ├── agents/
+│   │   └── delegation.py
 │   ├── api/routes/
 │   ├── budgets/models.py
 │   ├── budgets/tracker.py
@@ -232,6 +257,7 @@ G:\AgentCell
 │   ├── events/models.py
 │   ├── kernel/lifecycle.py
 │   ├── kernel/models.py
+│   ├── kernel/handoff.py
 │   ├── memory/
 │   ├── policy/engine.py
 │   ├── policy/models.py
@@ -248,6 +274,7 @@ G:\AgentCell
 │   ├── tools/executor.py
 │   ├── tools/models.py
 │   ├── tools/registry.py
+│   ├── tools/delegation.py
 │   └── tools/workspace.py
 ├── tests/
 │   ├── unit/
@@ -262,7 +289,11 @@ G:\AgentCell
 │   └── versions/
 │       ├── 20260710_0001_create_runs_and_events.py
 │       ├── 20260713_0002_add_approvals_checkpoints.py
-│       └── 20260713_0003_add_memory_artifacts.py
+│       ├── 20260713_0003_add_memory_artifacts.py
+│       ├── 20260713_0004_add_agent_delegations.py
+│       ├── 20260713_0005_add_agents.py
+│       ├── 20260714_0006_add_conversations.py
+│       └── 20260714_0007_add_file_changes.py
 └── web/src/
     ├── api/
     ├── components/
@@ -273,17 +304,9 @@ G:\AgentCell
 
 ## 6. 下一位开发者的建议入口
 
-按以下顺序推进阶段 8，并保持子 Agent 权限和预算只能收窄：
+先执行阶段 9.2.1 正确性收口：固定审批恢复的 Agent/模型身份，在审批前完成 Tool preflight 和一次有界参数纠正，修正审批热键与 pending 恢复，修复 Qwen 中文 UTF-8 offset 误判，增加窄范围 FinalOutputGuard 阻止 DeepSeek DSML/伪工具协议成为 completed 结果，确保失败终态仍返回稳定 Run/Conversation ID，并把回滚 Lease 改为服务端推导。优先改善 Artifact 有界摘要，只有测试证明需要时才增加受引用范围约束的 `artifact.load`。完成迁移、离线套件、Ruff、Pyright 和两家真实 Provider 冒烟测试后形成独立稳定提交。
 
-1. 阅读 `AGENTS.md`、阶段 8 计划和现有 AgentSpec、CapabilityLease、BudgetTracker、Checkpoint；
-2. 定义 coordinator、coder、reviewer、researcher、summarizer 的实际工具与能力集合，reviewer 默认只读；
-3. 实现父 Run 分配子预算，请求数、Token、费用、工具调用、持续时间、数量和深度均不得超过父剩余量；
-4. 实现 Agent as Tool 的结构化委派、状态事件和父子 Run 关联；
-5. 实现 Coordinator → Coder → Reviewer → Finalizer 的程序化 Handoff；
-6. 将父子关系、预算和未完成委派写入检查点并支持恢复；
-7. 覆盖越权租约、预算超分、最大深度、reviewer 写入拒绝和子 Agent 失败传播测试。
-
-详细验收条件见 `docs/development-steps.md` 的阶段 8。
+随后执行阶段 9.2.2：拆分过大的 CLI 模块，建立统一 CliRunProfile，收敛参数兼容层，为 AgentRegistry 增加来源与 public/internal 可见性，并实现 transport-neutral RunDisplayProjector 与 Rich Live 双区视图。再进入阶段 9.3，只接通显式 `--team software` 程序化 Handoff；自主 `--collaborate` 不阻塞 Web。阶段 10 先交付 Conversation/Run/审批/变更/预算工作台，阶段 10.1 再补 Agent、记忆、Provider 和成本管理页面。Artifact 引用清理、高级 Git、Shell 副作用检测和独立回滚 Run 统一在阶段 11 完成。
 
 ## 7. 环境与命令
 
@@ -306,7 +329,9 @@ uv run agentcell run --offline-fake "分析当前项目"
 uv run agentcell run --offline-fake --json "分析当前项目"
 uv run agentcell replay <run-id>
 uv run agentcell branch <run-id> --from-sequence 18
+uv run agentcell resume <run-id> --offline-fake
 uv run agentcell cancel <run-id>
+uv run agentcell serve --offline-fake
 uv run python -m pytest
 uv run ruff check .
 uv run ruff format --check .
@@ -320,16 +345,16 @@ Web 尚未初始化，不应运行 `pnpm install` 或假设已有前端脚本。
 在 uv 管理的 Python 3.12.11 环境中执行：
 
 ```text
-uv run python -m pytest -q    158 passed, 2 skipped（真实 Provider，当前进程未启用付费开关）
+uv run python -m pytest -q    195 passed, 6 skipped（真实 Provider，当前进程未启用付费开关）
 uv run ruff check .           passed
 uv run ruff format --check .  passed
 uv run pyright                0 errors, 0 warnings
-uv run alembic upgrade head   passed, 20260713_0003 (head)
+uv run alembic upgrade head   passed, 20260713_0005 (head，隔离临时数据库)
 uv run alembic check          no new upgrade operations detected
 uv lock --check               passed
 ```
 
-本轮已运行数据库迁移、审批恢复、工作区创建/补丁/删除、哈希冲突、Diff Artifact 检查点、junction 逃逸、Shell argv/环境/输出边界、HTTP DNS 固定/重定向/SSRF/响应上限和非幂等防重放测试。默认数据库保持 `20260713_0003 (head)`，阶段 7.1 无 Schema 变更；Alembic check 无漂移。当前测试进程未启用付费 Provider 开关，因此两项真实 Provider 测试按设计跳过且没有产生线上调用。前端测试未运行，因为尚无应用实现。
+本轮已运行完整后端测试，并重点覆盖 Conversation 历史继承、跨进程续聊、作用域隔离、并发冲突、FastAPI、AG-UI/SSE、CLI、审批恢复和多 Agent 回归。默认迁移头为 `20260714_0006`，在隔离临时数据库完成 upgrade、downgrade 与 Alembic check，无 metadata 漂移；未改动工作区现有 `.agentcell` 数据库。当前进程未启用付费 Provider 开关，因此六项真实 Provider 测试按设计跳过且没有产生线上调用。前端测试未运行，因为尚无应用实现。
 
 ## 9. 交接时必须更新的内容
 

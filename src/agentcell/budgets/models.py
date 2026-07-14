@@ -36,6 +36,8 @@ class Usage(BaseModel):
 
     requests: NonNegativeInt = 0
     input_tokens: NonNegativeInt = 0
+    cache_write_tokens: NonNegativeInt = 0
+    cache_read_tokens: NonNegativeInt = 0
     output_tokens: NonNegativeInt = 0
     tool_calls: NonNegativeInt = 0
     duration_seconds: NonNegativeFloat = 0.0

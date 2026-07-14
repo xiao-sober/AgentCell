@@ -45,6 +45,9 @@ class ToolRegistry:
         except KeyError as error:
             raise ToolNotFoundError(tool_name) from error
 
+    def contains(self, tool_name: str) -> bool:
+        return tool_name in self._definitions
+
     def list(self) -> tuple[ToolDefinition[BaseModel], ...]:
         """Return definitions in stable name order."""
 

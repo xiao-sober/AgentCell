@@ -1,6 +1,12 @@
 """Structured registration, policy-aware execution, and safe workspace tools."""
 
 from agentcell.tools.artifacts import ArtifactMetadata
+from agentcell.tools.delegation import (
+    AgentDelegateOutput,
+    AgentDelegateParams,
+    agent_delegate,
+    register_delegation_tool,
+)
 from agentcell.tools.executor import ToolExecutor
 from agentcell.tools.http import (
     HostResolver,
@@ -11,7 +17,10 @@ from agentcell.tools.http import (
     register_http_tools,
 )
 from agentcell.tools.models import (
+    AgentDelegationExecutor,
+    ApprovalRecorder,
     ArtifactStore,
+    ChangeRecorder,
     ToolApprovalPreview,
     ToolApprovalPreviewer,
     ToolCall,
@@ -57,6 +66,11 @@ from agentcell.tools.workspace import (
 )
 
 __all__ = [
+    "AgentDelegateOutput",
+    "AgentDelegateParams",
+    "AgentDelegationExecutor",
+    "ApprovalRecorder",
+    "ChangeRecorder",
     "ArtifactStore",
     "ArtifactMetadata",
     "HostResolver",
@@ -97,6 +111,7 @@ __all__ = [
     "register_workspace_tools",
     "register_shell_tools",
     "register_http_tools",
+    "register_delegation_tool",
     "shell_run",
     "workspace_list",
     "workspace_delete",
@@ -104,4 +119,5 @@ __all__ = [
     "workspace_read",
     "workspace_search",
     "workspace_write",
+    "agent_delegate",
 ]

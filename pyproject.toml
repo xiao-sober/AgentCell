@@ -10,15 +10,19 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "AgentCell contributors" }]
 dependencies = [
+    "ag-ui-protocol>=0.1",
     "aiosqlite>=0.20,<1",
     "alembic>=1,<2",
+    "fastapi>=0.115",
     "httpx>=0.28,<1",
+    "opentelemetry-api>=1.30,<2",
     "pydantic>=2,<3",
     "pydantic-ai-slim[openai]>=2.8,<3",
     "pydantic-settings>=2.14,<3",
     "rich>=14,<15",
     "sqlalchemy>=2,<3",
     "typer>=0.16,<1",
+    "uvicorn>=0.34",
 ]
 
 [project.scripts]

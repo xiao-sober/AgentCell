@@ -2,6 +2,8 @@
 
 from agentcell.events.models import (
     REDACTED_VALUE,
+    AgentChildCompletedPayload,
+    AgentChildStartedPayload,
     ArtifactReference,
     DomainEvent,
     ErrorPayload,
@@ -23,6 +25,8 @@ from agentcell.events.models import (
 __all__ = [
     "REDACTED_VALUE",
     "ArtifactReference",
+    "AgentChildCompletedPayload",
+    "AgentChildStartedPayload",
     "DomainEvent",
     "ErrorPayload",
     "EventPayload",

@@ -10,13 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agentcell.agents import AgentRegistry, AgentSpec
 from agentcell.errors import ApprovalConflictError, ToolArgumentsError
-from agentcell.events import EventType, JsonValue
+from agentcell.events import EventType, GenericEventPayload, JsonValue
 from agentcell.kernel.run_service import RunRequest, RunResult, RunService
 from agentcell.policy import (
     ApprovalDecision,
     ApprovalDecisionKind,
     Capability,
     CapabilityLease,
+    PermissionMode,
     RiskLevel,
     ToolPolicy,
 )
@@ -28,7 +29,7 @@ from agentcell.providers import (
     FakeToolCallStep,
     ProviderFactory,
 )
-from agentcell.storage import Database, EventStore
+from agentcell.storage import ApprovalRepository, Database, EventStore
 from agentcell.tools import ToolDefinition, ToolExecutionContext, ToolRegistry
 
 
@@ -128,6 +129,55 @@ async def _pause(
         )
     finally:
         await providers.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_permission_mode_approves_guarded_tool_with_audit_event(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    counter = ActionCounter([])
+    service, providers = _service(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="test.action",
+                    arguments={"value": 7},
+                    tool_call_id="auto-approval-1",
+                ),
+                FakeTextStep(text="done"),
+            )
+        ),
+        counter,
+    )
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="perform action",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+                permission_mode=PermissionMode.AUTO,
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.run.status.value == "completed"
+    assert result.approvals == ()
+    assert counter.values == [7]
+    async with database.session() as session:
+        events = await EventStore(session).list_for_run(result.run.id)
+        approvals = await ApprovalRepository(session).list_for_run(result.run.id)
+    approved = [event for event in events if event.event_type is EventType.TOOL_APPROVED]
+    assert len(approved) == 1
+    payload = approved[0].payload
+    assert isinstance(payload, GenericEventPayload)
+    assert payload.data["decision_source"] == "policy-auto"
+    assert len(approvals) == 1
+    assert approvals[0].status.value == "approved"
+    assert approvals[0].decision_source is not None
+    assert approvals[0].decision_source.value == "policy-auto"
 
 
 @pytest.mark.asyncio

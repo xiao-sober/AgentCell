@@ -57,6 +57,8 @@ def test_tracker_accounts_for_requests_usage_tools_children_and_duration() -> No
     tracker.record_model_usage(
         input_tokens=25,
         output_tokens=10,
+        cache_write_tokens=4,
+        cache_read_tokens=15,
         cost=Decimal("0.75"),
     )
     tracker.reserve_tool_call()
@@ -67,6 +69,8 @@ def test_tracker_accounts_for_requests_usage_tools_children_and_duration() -> No
 
     assert snapshot.used.requests == 1
     assert snapshot.used.total_tokens == 35
+    assert snapshot.used.cache_write_tokens == 4
+    assert snapshot.used.cache_read_tokens == 15
     assert snapshot.used.tool_calls == 1
     assert snapshot.used.children == 1
     assert snapshot.used.max_depth_reached == 2
@@ -213,6 +217,34 @@ def test_limited_parent_rejects_child_without_a_cost_limit() -> None:
     assert captured.value.resource == "child.cost"
     assert captured.value.attempted is None
     assert tracker.usage.children == 0
+
+
+def test_completed_child_usage_is_rolled_into_parent_without_double_duration() -> None:
+    tracker = BudgetTracker(make_budget(), clock=FakeClock())
+    tracker.reserve_child(depth=1, child_budget=make_budget(max_children=0, max_depth=0))
+
+    usage = tracker.record_child_usage(
+        Usage(
+            requests=1,
+            input_tokens=2,
+            cache_write_tokens=1,
+            cache_read_tokens=2,
+            output_tokens=3,
+            tool_calls=1,
+            duration_seconds=99,
+            children=1,
+            max_depth_reached=1,
+        )
+    )
+
+    assert usage.requests == 1
+    assert usage.total_tokens == 5
+    assert usage.cache_write_tokens == 1
+    assert usage.cache_read_tokens == 2
+    assert usage.tool_calls == 1
+    assert usage.children == 2
+    assert usage.max_depth_reached == 2
+    assert usage.duration_seconds == 0
 
 
 def test_snapshot_rejects_naive_capture_time() -> None:

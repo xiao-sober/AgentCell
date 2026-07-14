@@ -40,6 +40,25 @@ Checkpoint 保存 Agent、用户、原始任务、工作区、CapabilityLease、
 
 决定和 `waiting_approval → running` 在外部工具执行前持久化。服务重启后可从最新 Checkpoint 恢复消息和预算。
 
+### 4.1 阶段 9.2 权限模式
+
+阶段 9.2 已为 CLI 增加 `request`、`auto`、`full` 三种权限模式。它们只决定已通过 AgentSpec、CapabilityLease、参数和安全策略校验的调用如何取得审批，不改变工具风险，也不扩大租约：
+
+- `request`：GUARDED/DANGEROUS 都创建 pending 审批并等待用户；
+- `auto`：PolicyEngine 可自动决定租约内 GUARDED，DANGEROUS 仍等待用户；
+- `full`：PolicyEngine 可自动决定显式租约内 GUARDED/DANGEROUS；
+- FORBIDDEN 和任何安全校验失败在所有模式下一律拒绝。
+
+自动决定必须记录 `decision_source`（policy-auto 或 policy-full）、模式、规则版本、理由和时间，复用相同的 approved/rejected 事件、Checkpoint、预算更新和执行账本。模型不得成为审批主体；自动决定不得伪装为用户决定，也不得形成跨 Run 或永久全局批准。
+
+### 4.2 阶段 9.2 文件变更恢复
+
+审批恢复解决“批准前暂停后如何继续”，FileChange 恢复解决“文件已经替换但 SQLite 账本尚未完成时如何对账”。当前实现会在执行写入前持久化 before/after Artifact、before/预期 after 哈希和完整 Diff，随后使用 `prepared → applied → completed` 状态记录文件系统副作用。
+
+重启恢复时：当前哈希等于预期 after 则补写完成；等于 before 才允许基于原批准继续；二者都不等则标记 conflict 并停止。非幂等执行账本仍负责防止盲目重复调用，FileChange 对账不得绕过它。
+
+用户请求回滚时创建新的审批和反向 FileChange：修改/补丁恢复 before Artifact，新建文件转为受审批删除，删除文件转为受审批恢复。只有当前状态仍与原 after 状态一致时才能执行；回滚后保留原记录并建立 `reverts_change_id` 关联，不删除历史。Git 仅补充 HEAD/dirty/path Diff 信息，不参与自动 reset 或全工作区恢复。
+
 ## 5. 非幂等防重放
 
 `tool_executions` 使用 `(run_id, provider_call_id)` 唯一键：

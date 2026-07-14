@@ -27,5 +27,12 @@ class AgentRegistry:
         except KeyError as error:
             raise AgentNotFoundError(agent_id) from error
 
+    def replace(self, spec: AgentSpec) -> None:
+        """Replace an existing declaration without mutating active Run state."""
+
+        if spec.id not in self._specs:
+            raise AgentNotFoundError(spec.id)
+        self._specs[spec.id] = spec
+
     def list(self) -> tuple[AgentSpec, ...]:
         return tuple(self._specs[agent_id] for agent_id in sorted(self._specs))

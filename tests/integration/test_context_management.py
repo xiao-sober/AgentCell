@@ -23,7 +23,12 @@ from pydantic_ai.messages import (
 from agentcell.agents import AgentRegistry, AgentSpec
 from agentcell.events import ArtifactReference, EventType
 from agentcell.kernel.run_service import RunRequest, RunService
-from agentcell.memory.compaction import PairSafeTrimmer, ToolOutputCompactor
+from agentcell.memory.compaction import (
+    PairSafeTokenTrimmer,
+    PairSafeTrimmer,
+    ToolOutputCompactor,
+    estimate_message_tokens,
+)
 from agentcell.memory.injector import MemoryInjector
 from agentcell.memory.models import MemoryCandidate, MemoryKind, MemoryScope
 from agentcell.memory.service import MemoryService
@@ -68,6 +73,34 @@ def test_pair_safe_trimmer_never_orphans_tool_call_or_result() -> None:
 
     assert call_ids == result_ids == {"call-1"}
     assert trimmed[0] == history[0]
+
+
+def test_token_trimmer_combines_estimated_limit_with_atomic_tool_pairs() -> None:
+    first = ModelRequest(parts=[UserPromptPart("keep task")])
+    old = ModelResponse(parts=[TextPart("x" * 9_000)])
+    call = ModelResponse(parts=[ToolCallPart("workspace.read", {"path": "README.md"}, "c1")])
+    result = ModelRequest(parts=[ToolReturnPart("workspace.read", {"content": "ok"}, "c1")])
+    latest = ModelResponse(parts=[TextPart("latest answer")])
+    required = [first, call, result, latest]
+    max_tokens = estimate_message_tokens(required) + 10
+
+    trimmed = PairSafeTokenTrimmer(max_tokens).trim([first, old, call, result, latest])
+
+    assert trimmed == required
+    assert estimate_message_tokens(trimmed) <= max_tokens
+    call_ids = {
+        part.tool_call_id
+        for message in trimmed
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    }
+    result_ids = {
+        part.tool_call_id
+        for message in trimmed
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    }
+    assert call_ids == result_ids == {"c1"}
 
 
 @pytest.mark.asyncio

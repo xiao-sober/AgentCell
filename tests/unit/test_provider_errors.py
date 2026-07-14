@@ -83,6 +83,17 @@ def test_classified_error_does_not_retain_body_or_credential() -> None:
     assert not hasattr(classified, "body")
 
 
+def test_protocol_error_exposes_status_without_response_body() -> None:
+    classified = classify_provider_error(
+        "deepseek",
+        "deepseek-v4-pro",
+        ModelHTTPError(400, "deepseek-v4-pro", {"message": "sensitive request details"}),
+    )
+
+    assert str(classified).endswith("request was rejected (HTTP 400)")
+    assert "sensitive request details" not in str(classified)
+
+
 def test_retry_policy_obeys_classification_and_attempt_ceiling() -> None:
     retryable = ProviderRateLimitError("deepseek", "deepseek-v4-pro", "limited")
     terminal = ProviderAuthenticationError("deepseek", "deepseek-v4-pro", "rejected")

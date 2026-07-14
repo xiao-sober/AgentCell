@@ -68,6 +68,8 @@ ToolRegistry
 
 两个 Shell 工具都标记为 DANGEROUS、需要审批且非幂等。`shell.test` 只是产品语义名称，不能假定任意测试命令可安全自动重试。
 
+CLI 使用可重复的 `--allow-command` 构建本 Run 的精确命令集合，没有内置的通用安全命令表。`pytest`、`python -m pytest` 与 `uv run pytest` 的 `command` 分别是 `pytest`、`python`、`uv`，必须分别授权；批准 `python` 或 `uv` 等解释器/启动器的权限范围显著大于只批准 `pytest`。`full` 只自动作出审批决定，不会把 `pytest` 租约扩大为 `python`。参数不经 Shell 解释，因此管道、`>`、`2>&1` 等文本不能作为重定向使用。
+
 首版 Shell 是进程级约束，不是强隔离沙箱。被批准的解释器或构建工具仍可能自行访问系统资源，也可能创建后代进程；高对抗场景需要后续强隔离 Sandbox。
 
 ## 4. HTTP 工具
@@ -93,7 +95,13 @@ ToolRegistry
 
 `register_workspace_tools` 注册六个工作区工具；`register_shell_tools` 和 `register_http_tools` 必须显式调用。仅注册工具不会授予能力：AgentSpec 必须选择工具，RunRequest 还必须提供相应 CapabilityLease，两层缺一都会默认拒绝。
 
-内置 coordinator 继续保持只读，避免 CLI 在没有完整交互式审批中心时默认扩大权限。阶段 7.1 的生产工具可由 RunService 使用自定义 AgentSpec 显式启用；完整 CLI/API 管理入口在产品接口阶段提供。
+内置 coordinator 继续保持只读，避免 CLI 默认扩大权限。阶段 9.2 已通过 `run/chat --agent coder`、显式写路径/命令租约和交互式 Diff 审批暴露生产写入工具；未获得命令租约时 Shell 工具不会进入本次模型工具集。
+
+阶段 9.2 的 CLI 权限模式只改变审批策略，不改变本节安全边界：`request` 对 GUARDED/DANGEROUS 逐次询问；`auto` 仅由 PolicyEngine 自动批准租约内 GUARDED；`full` 可自动批准显式租约内 GUARDED/DANGEROUS。三种模式都必须拒绝 FORBIDDEN、敏感路径、工作区逃逸、未授权命令和 SSRF；`full` 不允许任意系统路径、通配命令、`shell=True` 或永久全局批准。自动审批持久化决定来源、Diff、事件和非幂等执行账本；只有实际暂停的人工审批创建等待审批检查点。
+
+阶段 9.2 已为 workspace.write/patch/delete 增加 ChangeSet/FileChange：审批后、实际副作用前保存修改前后内容 Artifact、前后哈希和完整 Diff，执行后复核当前哈希，并以 prepared/applied/completed/conflict 状态覆盖文件系统与 SQLite 之间的故障窗口。删除和新建分别使用 `after=None` 与 `before=None` 表达，不丢失可恢复内容。
+
+Git 仓库存在时，可选 GitWorkspaceInspector 记录 HEAD、分支、Run 开始时的 dirty 路径和本 Run 触碰路径的 Git Diff；非 Git 工作区保持相同 AgentCell 回滚能力。回滚使用 Artifact 和 expected hash 创建新的受审批操作，不使用 `git reset --hard`、全工作区 checkout/restore、clean、stash、commit 或 push，也不得覆盖用户在 Agent 之后继续修改的文件。
 
 ## 6. 当前非目标
 

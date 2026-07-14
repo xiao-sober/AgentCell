@@ -14,10 +14,19 @@ from agentcell.errors import (
 from agentcell.policy import (
     Capability,
     CapabilityLease,
+    PermissionMode,
     PolicyEngine,
     RiskLevel,
     ToolPolicy,
 )
+
+
+def test_permission_modes_never_approve_forbidden_operations() -> None:
+    assert not PermissionMode.REQUEST.automatically_approves(RiskLevel.GUARDED)
+    assert PermissionMode.AUTO.automatically_approves(RiskLevel.GUARDED)
+    assert not PermissionMode.AUTO.automatically_approves(RiskLevel.DANGEROUS)
+    assert PermissionMode.FULL.automatically_approves(RiskLevel.DANGEROUS)
+    assert not PermissionMode.FULL.automatically_approves(RiskLevel.FORBIDDEN)
 
 
 def test_capability_lease_defaults_to_no_authority() -> None:

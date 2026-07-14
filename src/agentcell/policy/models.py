@@ -28,6 +28,25 @@ class RiskLevel(StrEnum):
     FORBIDDEN = "forbidden"
 
 
+class PermissionMode(StrEnum):
+    """Run-scoped approval policy that never widens a capability lease."""
+
+    REQUEST = "request"
+    AUTO = "auto"
+    FULL = "full"
+
+    def automatically_approves(self, risk: RiskLevel) -> bool:
+        """Return whether an already leased operation may skip human approval."""
+
+        if risk is RiskLevel.FORBIDDEN:
+            return False
+        if self is PermissionMode.FULL:
+            return risk in {RiskLevel.GUARDED, RiskLevel.DANGEROUS}
+        if self is PermissionMode.AUTO:
+            return risk is RiskLevel.GUARDED
+        return False
+
+
 class Capability(StrEnum):
     """Coarse capabilities checked before tool-specific scope checks."""
 

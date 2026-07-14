@@ -15,7 +15,13 @@ from agentcell.errors import BudgetExceededError, InvalidBudgetUsageError
 class BudgetTracker:
     """Track active Run usage and reject reservations that exceed hard limits."""
 
-    __slots__ = ("_budget", "_clock", "_started_at", "_usage")
+    __slots__ = (
+        "_budget",
+        "_clock",
+        "_last_model_input_tokens",
+        "_started_at",
+        "_usage",
+    )
 
     def __init__(
         self,
@@ -26,6 +32,9 @@ class BudgetTracker:
     ) -> None:
         self._budget = budget
         self._usage = initial_usage or Usage()
+        self._last_model_input_tokens = (
+            0 if self._usage.requests == 0 else self._usage.input_tokens // self._usage.requests
+        )
         self._clock = clock
         self._started_at = self._read_clock()
         self._ensure_within(self._usage)
@@ -42,6 +51,12 @@ class BudgetTracker:
 
         now = self._read_clock()
         return self._usage_at(now)
+
+    @property
+    def last_model_input_tokens(self) -> int:
+        """Return the latest request input usage, or a restored-run average."""
+
+        return self._last_model_input_tokens
 
     @property
     def remaining(self) -> BudgetRemaining:
@@ -64,12 +79,16 @@ class BudgetTracker:
         *,
         input_tokens: int,
         output_tokens: int,
+        cache_write_tokens: int = 0,
+        cache_read_tokens: int = 0,
         cost: Decimal = Decimal("0"),
     ) -> Usage:
         """Record actual Provider usage, retaining it even when it crosses a limit."""
 
         self._validate_non_negative_int("input_tokens", input_tokens)
         self._validate_non_negative_int("output_tokens", output_tokens)
+        self._validate_non_negative_int("cache_write_tokens", cache_write_tokens)
+        self._validate_non_negative_int("cache_read_tokens", cache_read_tokens)
         self._validate_non_negative_decimal("cost", cost)
 
         now = self._read_clock()
@@ -77,9 +96,12 @@ class BudgetTracker:
         candidate = self._build_usage(
             current,
             input_tokens=current.input_tokens + input_tokens,
+            cache_write_tokens=current.cache_write_tokens + cache_write_tokens,
+            cache_read_tokens=current.cache_read_tokens + cache_read_tokens,
             output_tokens=current.output_tokens + output_tokens,
             cost=current.cost + cost,
         )
+        self._last_model_input_tokens = input_tokens
         self._commit(candidate, now)
         self._ensure_within(candidate)
         return candidate
@@ -109,6 +131,38 @@ class BudgetTracker:
                 remaining=self._remaining_for(candidate),
             )
         self._commit(candidate, now)
+        return candidate
+
+    def record_child_usage(self, usage: Usage, *, depth: int = 1) -> Usage:
+        """Roll a completed child's real subtree usage into this Run.
+
+        The direct child slot is reserved separately by :meth:`reserve_child`. Duration is
+        intentionally not added because the parent wall clock already covers synchronous child
+        execution and paused time is restored from checkpoints independently.
+        """
+
+        self._validate_non_negative_int("depth", depth)
+        if depth == 0:
+            raise InvalidBudgetUsageError("depth", depth)
+        now = self._read_clock()
+        current = self._usage_at(now)
+        candidate = self._build_usage(
+            current,
+            requests=current.requests + usage.requests,
+            input_tokens=current.input_tokens + usage.input_tokens,
+            cache_write_tokens=current.cache_write_tokens + usage.cache_write_tokens,
+            cache_read_tokens=current.cache_read_tokens + usage.cache_read_tokens,
+            output_tokens=current.output_tokens + usage.output_tokens,
+            tool_calls=current.tool_calls + usage.tool_calls,
+            cost=current.cost + usage.cost,
+            children=current.children + usage.children,
+            max_depth_reached=max(
+                current.max_depth_reached,
+                depth + usage.max_depth_reached,
+            ),
+        )
+        self._commit(candidate, now)
+        self._ensure_within(candidate)
         return candidate
 
     def snapshot(self, *, captured_at: datetime | None = None) -> BudgetSnapshot:
@@ -164,6 +218,8 @@ class BudgetTracker:
         *,
         requests: int | None = None,
         input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
         output_tokens: int | None = None,
         tool_calls: int | None = None,
         duration_seconds: float | None = None,
@@ -174,6 +230,12 @@ class BudgetTracker:
         return Usage(
             requests=usage.requests if requests is None else requests,
             input_tokens=usage.input_tokens if input_tokens is None else input_tokens,
+            cache_write_tokens=(
+                usage.cache_write_tokens if cache_write_tokens is None else cache_write_tokens
+            ),
+            cache_read_tokens=(
+                usage.cache_read_tokens if cache_read_tokens is None else cache_read_tokens
+            ),
             output_tokens=usage.output_tokens if output_tokens is None else output_tokens,
             tool_calls=usage.tool_calls if tool_calls is None else tool_calls,
             duration_seconds=(

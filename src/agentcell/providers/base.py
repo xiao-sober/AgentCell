@@ -223,7 +223,7 @@ def _classify_http_status(
     return ProviderProtocolError(
         provider,
         model,
-        "request was rejected",
+        f"request was rejected (HTTP {status_code})",
         status_code=status_code,
     )
 

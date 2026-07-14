@@ -9,6 +9,7 @@ import os
 import re
 import stat
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -25,7 +26,7 @@ from agentcell.errors import (
     WorkspacePathTypeError,
     WorkspaceStateConflictError,
 )
-from agentcell.policy import Capability, RiskLevel, ToolPolicy
+from agentcell.policy import Capability, CapabilityLease, RiskLevel, ToolPolicy
 from agentcell.tools.models import (
     ToolApprovalPreview,
     ToolDefinition,
@@ -190,6 +191,99 @@ class WorkspaceMutationResult(BaseModel):
     operation: Literal["created", "replaced", "patched", "deleted"]
     bytes_written: int = Field(ge=0)
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedWorkspaceChange:
+    """Validated bytes used by the durable change ledger before mutation."""
+
+    path: str
+    operation: Literal["created", "replaced", "patched", "deleted"]
+    before: bytes | None
+    after: bytes | None
+
+
+async def prepare_workspace_change(
+    tool_name: str,
+    params: BaseModel,
+    context: ToolExecutionContext,
+) -> PlannedWorkspaceChange | None:
+    """Reuse mutation validation to produce an exact durable before/after plan."""
+
+    resolver = WorkspacePathResolver(context.workspace)
+    if tool_name == "workspace.write" and isinstance(params, WorkspaceWriteParams):
+        target, previous, updated = await asyncio.to_thread(
+            _prepare_write,
+            resolver,
+            params,
+            context.lease.filesystem_read,
+            context.lease.filesystem_write,
+        )
+        return PlannedWorkspaceChange(
+            path=resolver.relative_name(target),
+            operation="created" if previous is None else "replaced",
+            before=None if previous is None else previous.encode("utf-8"),
+            after=updated.encode("utf-8"),
+        )
+    if tool_name == "workspace.patch" and isinstance(params, WorkspacePatchParams):
+        target, previous, updated = await asyncio.to_thread(
+            _prepare_patch,
+            resolver,
+            params,
+            context.lease.filesystem_read,
+            context.lease.filesystem_write,
+        )
+        return PlannedWorkspaceChange(
+            path=resolver.relative_name(target),
+            operation="patched",
+            before=previous.encode("utf-8"),
+            after=updated.encode("utf-8"),
+        )
+    if tool_name == "workspace.delete" and isinstance(params, WorkspaceDeleteParams):
+        target, previous = await asyncio.to_thread(
+            _prepare_delete,
+            resolver,
+            params,
+            context.lease.filesystem_read,
+            context.lease.filesystem_write,
+        )
+        return PlannedWorkspaceChange(
+            path=resolver.relative_name(target),
+            operation="deleted",
+            before=previous,
+            after=None,
+        )
+    return None
+
+
+async def revert_workspace_change(
+    *,
+    workspace: Path,
+    lease: CapabilityLease,
+    path: str,
+    current_sha256: str | None,
+    desired: bytes | None,
+) -> None:
+    """Apply one hash-guarded reverse transition through workspace safety checks."""
+
+    resolver = WorkspacePathResolver(workspace)
+    target = resolver.resolve_write(
+        path,
+        allowed_scopes=lease.filesystem_write,
+        must_exist=current_sha256 is not None,
+    )
+    resolver.ensure_within(
+        target,
+        allowed_scopes=lease.filesystem_read,
+        lease_name="filesystem_read",
+    )
+    if desired is None:
+        if current_sha256 is None:
+            raise WorkspaceStateConflictError(path)
+        await asyncio.to_thread(_delete_expected, target, current_sha256, path)
+        return
+    content = _decode_utf8(desired, path)
+    await asyncio.to_thread(_atomic_write, target, content, current_sha256)
 
 
 class WorkspacePathResolver:

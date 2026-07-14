@@ -6,6 +6,7 @@ import asyncio
 import json
 from time import monotonic
 from typing import cast
+from uuid import UUID
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -13,6 +14,7 @@ from agentcell.errors import (
     AgentCellError,
     ToolApprovalRequiredError,
     ToolArgumentsError,
+    ToolCallDeferredError,
     ToolExecutionError,
     ToolOutputTooLargeError,
     ToolTimeoutError,
@@ -43,6 +45,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         *,
         approval_granted: bool = False,
+        approval_source: str | None = None,
     ) -> ToolResult:
         """Validate, authorize, account, run, bound output, and emit ordered events."""
 
@@ -57,8 +60,9 @@ class ToolExecutor:
                 }
             ),
         )
-
         execution_claimed = False
+        change_id: UUID | None = None
+        change_completed = False
         try:
             definition = self._registry.get(call.tool_name)
             try:
@@ -72,6 +76,31 @@ class ToolExecutor:
                 context.lease,
                 approval_granted=approval_granted,
             )
+            if approval_source is not None:
+                preview = (
+                    None
+                    if definition.approval_previewer is None
+                    else await definition.approval_previewer(params, context)
+                )
+                if context.approvals is not None:
+                    await context.approvals.record(
+                        call,
+                        context,
+                        policy=definition.policy,
+                        preview=preview,
+                        source=approval_source,
+                    )
+                else:
+                    await context.events.emit(
+                        EventType.TOOL_APPROVED,
+                        GenericEventPayload(
+                            data={
+                                "provider_call_id": call.provider_call_id,
+                                "tool_name": call.tool_name,
+                                "decision_source": approval_source,
+                            }
+                        ),
+                    )
             if context.ledger is not None:
                 previous = await context.ledger.begin(
                     call,
@@ -83,9 +112,11 @@ class ToolExecutor:
                         GenericEventPayload(
                             data={
                                 "call_id": str(call.call_id),
+                                "provider_call_id": call.provider_call_id,
                                 "tool_name": call.tool_name,
                                 "replayed": True,
                                 "output_bytes": previous.output_bytes,
+                                "output": _bounded_event_output(previous),
                             }
                         ),
                     )
@@ -112,11 +143,15 @@ class ToolExecutor:
                 GenericEventPayload(
                     data={
                         "call_id": str(call.call_id),
+                        "provider_call_id": call.provider_call_id,
                         "tool_name": call.tool_name,
                         "timeout_seconds": definition.policy.timeout_seconds,
                     }
                 ),
             )
+
+            if context.changes is not None:
+                change_id = await context.changes.prepare(call, params, context)
 
             started_at = monotonic()
             try:
@@ -128,6 +163,9 @@ class ToolExecutor:
                     definition.policy.timeout_seconds,
                 ) from error
             duration_ms = max(0.0, (monotonic() - started_at) * 1000)
+            if change_id is not None and context.changes is not None:
+                await context.changes.complete(change_id, context)
+                change_completed = True
             output = _normalize_output(raw_output, tool_name=call.tool_name)
             result = await self._bound_output(
                 call,
@@ -143,8 +181,10 @@ class ToolExecutor:
                 GenericEventPayload(
                     data={
                         "call_id": str(call.call_id),
+                        "provider_call_id": call.provider_call_id,
                         "tool_name": call.tool_name,
                         "output_bytes": result.output_bytes,
+                        "output": _bounded_event_output(result),
                         "truncated": result.truncated,
                         "artifact": (
                             None
@@ -156,9 +196,11 @@ class ToolExecutor:
                 ),
             )
             return result
-        except ToolApprovalRequiredError:
+        except (ToolApprovalRequiredError, ToolCallDeferredError):
             raise
         except asyncio.CancelledError:
+            if change_id is not None and not change_completed and context.changes is not None:
+                await asyncio.shield(context.changes.fail(change_id, context))
             if execution_claimed and context.ledger is not None:
                 await context.ledger.fail(call)
             await self._emit_failure(
@@ -170,6 +212,8 @@ class ToolExecutor:
             )
             raise
         except AgentCellError as error:
+            if change_id is not None and not change_completed and context.changes is not None:
+                await context.changes.fail(change_id, context)
             if execution_claimed and context.ledger is not None:
                 await context.ledger.fail(call)
             await self._emit_failure(
@@ -181,6 +225,8 @@ class ToolExecutor:
             )
             raise
         except Exception as error:
+            if change_id is not None and not change_completed and context.changes is not None:
+                await context.changes.fail(change_id, context)
             if execution_claimed and context.ledger is not None:
                 await context.ledger.fail(call)
             classified = ToolExecutionError(call.tool_name)
@@ -271,4 +317,18 @@ def _bounded_event_arguments(arguments: dict[str, JsonValue]) -> dict[str, JsonV
     return {
         "summary": "Tool arguments omitted from the event payload because they exceed 32 KiB",
         "argument_bytes": len(encoded),
+    }
+
+
+def _bounded_event_output(result: ToolResult) -> JsonValue:
+    encoded = json.dumps(
+        result.output,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) <= 32 * 1024:
+        return result.output
+    return {
+        "summary": "Tool output omitted from the event payload because it exceeds 32 KiB",
+        "output_bytes": result.output_bytes,
     }

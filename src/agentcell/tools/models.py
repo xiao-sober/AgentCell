@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from agentcell.budgets import BudgetTracker
 from agentcell.events import ArtifactReference, EventPayload, EventType, JsonValue
 from agentcell.policy import CapabilityLease, ToolPolicy
+
+if TYPE_CHECKING:
+    from agentcell.agents import DelegationRequest, DelegationResult
 
 type ToolHandlerOutput = JsonValue | BaseModel
 
@@ -94,6 +97,47 @@ class ToolExecutionLedger(Protocol):
         ...
 
 
+class ChangeRecorder(Protocol):
+    """Durable before/after recorder for workspace mutation tools."""
+
+    async def prepare(
+        self,
+        call: ToolCall,
+        params: BaseModel,
+        context: ToolExecutionContext,
+    ) -> UUID | None: ...
+
+    async def complete(self, change_id: UUID, context: ToolExecutionContext) -> None: ...
+
+    async def fail(self, change_id: UUID, context: ToolExecutionContext) -> None: ...
+
+
+class ApprovalRecorder(Protocol):
+    """Persist one deterministic PolicyEngine approval before execution."""
+
+    async def record(
+        self,
+        call: ToolCall,
+        context: ToolExecutionContext,
+        *,
+        policy: ToolPolicy,
+        preview: ToolApprovalPreview | None,
+        source: str,
+    ) -> UUID: ...
+
+
+class AgentDelegationExecutor(Protocol):
+    """Kernel-owned child execution boundary injected into delegation tools."""
+
+    async def delegate(
+        self,
+        request: DelegationRequest,
+        context: ToolExecutionContext,
+        *,
+        provider_call_id: str,
+    ) -> DelegationResult: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExecutionContext:
     """Explicit Run-scoped dependencies available to tool execution."""
@@ -104,6 +148,15 @@ class ToolExecutionContext:
     events: ToolEventSink
     artifacts: ArtifactStore | None = None
     ledger: ToolExecutionLedger | None = None
+    changes: ChangeRecorder | None = None
+    approvals: ApprovalRecorder | None = None
+    run_id: UUID | None = None
+    conversation_id: UUID | None = None
+    user_id: UUID | None = None
+    agent_id: str | None = None
+    depth: int = 0
+    delegation: AgentDelegationExecutor | None = None
+    provider_call_id: str | None = None
 
 
 class ToolHandler[ParamsT: BaseModel](Protocol):

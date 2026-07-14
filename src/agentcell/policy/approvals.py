@@ -26,6 +26,12 @@ class ApprovalDecisionKind(StrEnum):
     MODIFY = "modify"
 
 
+class ApprovalDecisionSource(StrEnum):
+    HUMAN = "human"
+    POLICY_AUTO = "policy-auto"
+    POLICY_FULL = "policy-full"
+
+
 class Approval(BaseModel):
     """Full impact envelope shown to a user before guarded execution."""
 
@@ -51,6 +57,7 @@ class Approval(BaseModel):
     status: ApprovalStatus = ApprovalStatus.PENDING
     grant_same_tool: bool = False
     decision_message: str | None = None
+    decision_source: ApprovalDecisionSource | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     decided_at: datetime | None = None
 

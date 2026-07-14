@@ -25,7 +25,7 @@ ToolCall
 - `shell.run/test`：命令租约、argv、最小环境和输出限制；
 - `http.request`：HTTPS 域名租约、DNS 固定、逐跳重定向和响应限制。
 
-Memory 和 Agent delegation 工具尚未实现。内置 coordinator 仍只选择三个只读工作区工具；生产工具必须由 AgentSpec 显式选择，并由 Run 的 CapabilityLease 再次授权。不存在“已经注册，所以默认可用”的隐式能力。
+Memory 工具尚未实现。Agent delegation 已由阶段 8 实现，但默认 coordinator 仍保持三个只读工作区工具；只有显式使用 collaborative coordinator 或自定义 AgentSpec 才暴露 `agent.delegate`，并且 Run 的 CapabilityLease 必须再次授权。不存在“已经注册，所以默认可用”的隐式能力。
 
 ## 2. ToolRegistry 与 ToolPolicy
 
@@ -38,6 +38,8 @@ Memory 和 Agent delegation 工具尚未实现。内置 coordinator 仍只选择
 - 异步 Handler。
 
 Registry 拒绝重复注册和非严格参数 Schema，不允许后注册工具静默覆盖已有实现。
+
+领域工具名允许使用点号表达命名空间，例如 `workspace.list`。Provider 请求边界会将其映射成 `workspace_list` 等可移植函数名；模型返回后必须解析回原名称，禁止把 Provider 别名写入审批、事件或执行账本。
 
 `ToolPolicy` 包含风险、审批、幂等性、超时、最大输出字节数和能力集合。`DANGEROUS` 工具在 Schema 层就必须声明需要审批；`FORBIDDEN` 工具无论是否传入审批标志都不会执行。
 
@@ -88,6 +90,8 @@ tool.failed
 
 阶段 5 的 RunService 负责把这个 Sink 绑定到 EventStore，并把 `ToolApprovalRequiredError` 转换为审批请求、Run 暂停和检查点；阶段 4 不伪造尚不存在的审批持久化。
 
+Run 进入保留的收尾窗口时（请求预算最多保留 2 次、工具预算最多保留 4 次），新工具会从后续请求中移除并注入明确的最终回答指令。审批或委派恢复正在处理 deferred tool result 时不得移除工具，否则会跳过已批准操作。
+
 ## 5. 工作区路径安全
 
 所有工作区请求必须经过 `WorkspacePathResolver`：
@@ -115,6 +119,10 @@ Handler 输出必须是 Pydantic 模型或合法 JSON 值。执行器使用 UTF-
 阶段 4 定义 `ArtifactStore` 协议并验证转存路径；阶段 7 已提供文件 Artifact Store、数据库元数据、加载哈希校验和检查点引用恢复。生产工具仍必须通过该协议外置大输出。
 
 阶段 7.1 已接入实际生产工具。写入、删除、Shell 和 HTTP 的参数、能力、审批、执行账本、Artifact 和恢复细节见 [生产工具安全边界](production-tools.md)。
+
+阶段 9.2 已把 AgentSpec、CapabilityLease 和审批模式分别暴露到 CLI：`--agent` 选择角色，`--allow-write`/`--allow-command` 构建本次 Run 的租约，`--permission-mode` 只决定租约内操作由人工还是 PolicyEngine 审批。最终工具集始终是 AgentSpec 工具与 Run 租约的交集；默认 coordinator 和 reviewer 继续只读。
+
+同阶段的 ChangeService 必须在写入前保存可验证 before Artifact、预期 after 哈希和 Diff，写入后保存 after Artifact，并通过状态机对账文件系统/SQLite 崩溃窗口。GitWorkspaceInspector 只能运行有界只读 Git argv 并输出工作区内路径；`.git` 仍是普通 workspace 工具的禁止路径。安全回滚只反转选中的 FileChange，当前哈希不匹配即冲突，不能借 Git 命令重置整个工作树。
 
 ## 7. 已知边界
 

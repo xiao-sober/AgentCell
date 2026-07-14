@@ -57,6 +57,11 @@ class EventType(StrEnum):
     CONTEXT_COMPACTED = "context.compacted"
     BUDGET_UPDATED = "budget.updated"
     CHECKPOINT_CREATED = "checkpoint.created"
+    FILE_CHANGE_PREPARED = "file.change_prepared"
+    FILE_CHANGE_APPLIED = "file.change_applied"
+    FILE_CHANGE_COMPLETED = "file.change_completed"
+    FILE_CHANGE_CONFLICT = "file.change_conflict"
+    FILE_CHANGE_REVERTED = "file.change_reverted"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
@@ -168,8 +173,34 @@ class RunCompletedPayload(EventPayload):
     output_characters: int = Field(ge=0, strict=True)
     requests: int = Field(ge=0, strict=True)
     input_tokens: int = Field(ge=0, strict=True)
+    cache_write_tokens: int = Field(default=0, ge=0, strict=True)
+    cache_read_tokens: int = Field(default=0, ge=0, strict=True)
     output_tokens: int = Field(ge=0, strict=True)
     tool_calls: int = Field(ge=0, strict=True)
+
+
+class AgentChildStartedPayload(EventPayload):
+    """Stable parent/child identity and bounded allocation metadata."""
+
+    delegation_id: UUID
+    parent_run_id: UUID
+    child_run_id: UUID
+    agent_id: str = Field(min_length=1)
+    depth: int = Field(ge=1, strict=True)
+    trace_id: UUID
+    allocated_budget: dict[str, JsonValue]
+
+
+class AgentChildCompletedPayload(EventPayload):
+    """Terminal or handoff-stage child outcome metadata."""
+
+    delegation_id: UUID
+    parent_run_id: UUID
+    child_run_id: UUID
+    agent_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    trace_id: UUID
+    usage: dict[str, JsonValue]
 
 
 class ArtifactReference(BaseModel):
@@ -219,6 +250,8 @@ _PAYLOAD_MODELS: dict[EventType, type[EventPayload]] = {
     EventType.TOOL_FAILED: ErrorPayload,
     EventType.RUN_FAILED: ErrorPayload,
     EventType.RUN_COMPLETED: RunCompletedPayload,
+    EventType.AGENT_CHILD_STARTED: AgentChildStartedPayload,
+    EventType.AGENT_CHILD_COMPLETED: AgentChildCompletedPayload,
 }
 
 

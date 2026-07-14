@@ -541,6 +541,11 @@ memory.written
 context.compacted
 budget.updated
 checkpoint.created
+file.change_prepared
+file.change_applied
+file.change_completed
+file.change_conflict
+file.change_reverted
 run.completed
 run.failed
 run.cancelled
@@ -709,6 +714,18 @@ class CapabilityLease(BaseModel):
 
 不得默认提供永久全局批准。
 
+### 13.4 CLI 权限模式
+
+CLI 必须将 AgentSpec、CapabilityLease 和审批模式作为三个独立边界：AgentSpec 定义可用工具上限，CapabilityLease 定义当前 Run 的路径、命令和网络范围，审批模式只决定租约内操作何时需要人工决定。
+
+首版 CLI 权限模式包括：
+
+- `request`（请求审批）：GUARDED 和 DANGEROUS 操作逐次请求用户审批；
+- `auto`（替我审批）：仅由确定性的 PolicyEngine 自动批准租约内 GUARDED 操作，DANGEROUS 仍请求用户审批；
+- `full`（当前工作区完全访问）：PolicyEngine 可自动批准显式租约内 GUARDED 和 DANGEROUS 操作，但仍必须完整记录决定、事件、检查点和执行账本。
+
+权限模式不得让模型成为审批主体，不得为 AgentSpec 增加工具，不得扩大 CapabilityLease。任何模式下，FORBIDDEN、敏感路径、工作区逃逸、未授权命令、SSRF、预算超限和安全校验失败都必须拒绝。`full` 不等于任意系统访问，不得隐式允许 `*` 命令、`shell=True`、永久全局批准或绕过非幂等防重放。
+
 ---
 
 ## 14. 多 Agent 协作
@@ -764,11 +781,23 @@ Coordinator → Coder → Reviewer → Finalizer
 ### 15.1 四层记忆
 
 1. Working Memory：当前 Run 的计划、阶段和临时状态；
-2. Conversation Memory：完整消息与工具历史；
+2. Conversation Memory：完整有序的消息与工具历史，以及由其派生的可检索投影；
 3. Episodic Memory：某次任务的摘要、结果和经验；
 4. Semantic Memory：用户偏好、项目规则和稳定事实。
 
-### 15.2 首版检索
+### 15.2 Conversation 与多轮上下文
+
+- Conversation 是多个有序 Run 的容器，每次用户追问必须创建新的 Run；
+- 已完成的 Run 不得通过 `resume` 伪装成下一轮对话；
+- 新 Run 应加载同一 Conversation 中经过裁剪、压缩和脱敏的历史消息；
+- 完整有序的会话消息线程是权威记录，FTS 检索投影不能替代它；
+- 跨回合不得自动继承上一 Run 的剩余预算、临时审批或扩大后的能力租约；
+- 同一 Conversation 默认只允许一个活动 Run，冲突创建必须明确拒绝；
+- 用户、项目、工作区和 Agent 作用域必须校验，禁止跨作用域拼接历史；
+- 工具调用与工具结果跨 Run 注入时仍必须成对保留，大型内容继续使用 Artifact 引用；
+- 不持久化或回传原始模型思维链。
+
+### 15.3 首版检索
 
 首版使用 SQLite FTS5，不要求向量数据库。
 
@@ -782,7 +811,7 @@ Coordinator → Coder → Reviewer → Finalizer
 - Agent 作用域；
 - 标签匹配。
 
-### 15.3 记忆写入
+### 15.4 记忆写入
 
 模型可提出记忆候选，但 Memory Policy 决定：
 
@@ -891,6 +920,8 @@ approvals
 memory_items
 artifacts
 checkpoints
+change_sets
+file_changes
 ```
 
 SQLite 初始化必须启用：
@@ -925,6 +956,12 @@ GET    /api/runs/{run_id}/events
 POST   /api/runs/{run_id}/cancel
 POST   /api/runs/{run_id}/resume
 POST   /api/runs/{run_id}/branch
+
+POST   /api/conversations
+GET    /api/conversations
+GET    /api/conversations/{conversation_id}
+GET    /api/conversations/{conversation_id}/messages
+POST   /api/conversations/{conversation_id}/runs
 
 GET    /api/agents
 POST   /api/agents
@@ -964,6 +1001,8 @@ WebSocket 仅在未来实现交互式 PTY 时引入。
 - 错误返回统一 Problem Details 或统一错误模型；
 - API 路由不得包含业务编排；
 - Run 创建必须返回稳定 ID；
+- Conversation 中的新回合必须创建新 Run，并按消息序号加载有界历史；
+- 同一 Conversation 的并发活动 Run 必须返回冲突；
 - 恢复和分支操作必须幂等或明确返回冲突；
 - 敏感配置不得通过 API 返回。
 
@@ -977,6 +1016,8 @@ CLI 至少支持：
 agentcell chat
 agentcell run "分析当前项目"
 agentcell run --agent coordinator "修复测试失败"
+agentcell run --agent coder --permission-mode request "修复测试失败"
+agentcell chat --agent coder --permission-mode request
 agentcell run inspect <run-id>
 agentcell run replay <run-id>
 agentcell run branch <run-id> --from-sequence 18
@@ -984,6 +1025,10 @@ agentcell run cancel <run-id>
 agentcell agents list
 agentcell tools list
 agentcell memory search "数据库设计"
+agentcell changes list --run <run-id>
+agentcell changes show <change-id>
+agentcell changes diff <change-id>
+agentcell changes revert <change-id>
 agentcell serve
 ```
 
@@ -991,9 +1036,16 @@ CLI 必须：
 
 - 直接调用 `RunService`；
 - 支持 Rich 流式输出；
+- `run` 和新建 `chat` 支持显式选择 Agent；继续已有 Conversation 时不得静默更换固定 Agent；
+- 支持显式、可审计的写路径和命令租约参数，默认 coordinator 保持只读；
+- 支持 `request`、`auto` 和 `full` 三种 CLI 权限模式，并遵循 13.4 的不可突破边界；
 - 正确处理 Ctrl+C 并取消 Run；
 - 对审批提供交互式选择；
+- `agentcell chat` 必须在同一 Conversation 中连续创建 Run，并支持退出后按 ID 继续；
+- `agentcell run` 保持单任务入口，不得静默继承其他 Run 的历史；
 - 支持 JSON 输出，便于脚本集成；
+- Chat 每轮完成行同时显示 Run ID 和 Conversation ID，退出时打印可复制的继续命令；
+- 流式界面展示文本、工具、审批、预算和公开进度摘要，但不得显示原始模型思维链；
 - 返回有意义的进程退出码。
 
 ---
@@ -1002,13 +1054,14 @@ CLI 必须：
 
 首版页面包括：
 
-1. 任务工作台；
-2. 审批中心；
-3. 运行时间线；
-4. Agent 管理；
-5. 记忆管理；
-6. Provider 与模型状态；
-7. Token、费用和耗时统计。
+1. 任务与会话工作台；
+2. 会话消息线程和连续追问；
+3. 审批中心；
+4. 运行时间线；
+5. Agent 管理；
+6. 记忆管理；
+7. Provider 与模型状态；
+8. Token、费用和耗时统计。
 
 前端规则：
 
@@ -1084,6 +1137,10 @@ event_type
 - 删除操作必须审批；
 - 默认禁止访问 `.env`、密钥目录和版本控制凭据；
 - 大文件读取必须分块。
+- 每次已批准的创建、替换、补丁和删除必须保存可校验的 before/after 哈希、Artifact 和完整 Diff，并关联 Run、工具调用和审批；
+- 修改历史必须在非 Git 工作区仍可查询和恢复；Git 只提供 HEAD、dirty 状态和 path-scoped Diff 增强，不能替代 AgentCell ChangeSet/FileChange 账本；
+- 回滚必须创建新的受审批反向变更，并以当前哈希匹配原 after 哈希为前提，不得删除或改写原审计历史；
+- 文件系统与 SQLite 间的崩溃窗口必须通过 prepared/applied/completed/conflict 状态和哈希对账恢复，不得盲目重放非幂等写入。
 
 ### 23.2 Shell
 
@@ -1093,6 +1150,7 @@ event_type
 - 设置工作目录、超时、输出限制和环境白名单；
 - 高风险命令必须拒绝或审批；
 - 首版不承诺提供强隔离，文档必须明确这一点。
+- Git 检查仅允许受控只读 argv、path-scoped 输出、清洗环境、超时和大小限制；不得让模型读取 `.git`，不得在自动回滚中执行 `reset --hard`、全工作区 checkout/restore、clean、stash、commit 或 push。
 
 ### 23.3 网络
 
@@ -1184,6 +1242,8 @@ event_type
 - 上下文压缩；
 - SQLite 持久化；
 - 进程重启后恢复；
+- 同一 Conversation 的多轮消息继承与并发冲突；
+- 跨用户、项目、工作区和 Agent 的会话隔离；
 - SSE 事件顺序；
 - CLI 与 RunService。
 
@@ -1224,6 +1284,8 @@ event_type
 - 查看运行时间线；
 - 取消任务；
 - 恢复任务；
+- 在同一 Conversation 中连续追问并引用上一轮结果；
+- 重启服务后继续既有 Conversation；
 - 查看长期记忆。
 
 ---

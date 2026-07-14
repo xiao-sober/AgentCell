@@ -14,10 +14,11 @@ from agentcell.agents import AgentRegistry, AgentSpec
 from agentcell.budgets import Budget
 from agentcell.errors import (
     BudgetExceededError,
+    ModelOutputError,
     ProviderAuthenticationError,
     WorkspacePathNotFoundError,
 )
-from agentcell.events import EventType
+from agentcell.events import ErrorPayload, EventType
 from agentcell.kernel.run_service import RunRequest, RunService
 from agentcell.policy import Capability, CapabilityLease, RiskLevel, ToolPolicy
 from agentcell.providers import (
@@ -46,6 +47,7 @@ def _runtime(
     script: FakeScript,
     *,
     tool_names: tuple[str, ...] = (),
+    max_steps: int = 10,
 ) -> tuple[RunService, ProviderFactory]:
     model = FakeModelSpec(model="run-script")
     providers = ProviderFactory(
@@ -60,7 +62,7 @@ def _runtime(
         instructions="Complete the task using only registered tools.",
         tools=tool_names,
         capabilities=frozenset({Capability.FILESYSTEM_READ}) if tool_names else frozenset(),
-        max_steps=10,
+        max_steps=max_steps,
     )
     registry = ToolRegistry()
     register_workspace_tools(registry)
@@ -201,6 +203,113 @@ async def test_multiple_read_only_tool_calls_share_one_run_budget(
     assert result.output == "two tools complete"
     assert result.budget.used.requests == 3
     assert result.budget.used.tool_calls == 2
+
+
+def _final_window_budget() -> Budget:
+    return Budget(
+        max_requests=20,
+        max_input_tokens=100_000,
+        max_output_tokens=10_000,
+        max_total_tokens=110_000,
+        max_tool_calls=40,
+        max_duration_seconds=60,
+        max_cost=None,
+        max_children=0,
+        max_depth=0,
+    )
+
+
+def _exploration_steps() -> tuple[FakeToolCallStep, ...]:
+    return tuple(
+        FakeToolCallStep(
+            tool_name="workspace.list",
+            arguments={"path": "."},
+            tool_call_id=f"explore-{index}",
+        )
+        for index in range(17)
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_window_retries_invalid_tool_output_then_completes(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                *_exploration_steps(),
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "."},
+                    tool_call_id="hidden-tool-retry",
+                ),
+                FakeTextStep(text="final answer"),
+            )
+        ),
+        tool_names=("workspace.list",),
+        max_steps=20,
+    )
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="inspect then summarize",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+                budget=_final_window_budget(),
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "final answer"
+    assert result.budget.used.requests == 19
+    assert result.budget.used.tool_calls == 17
+
+
+@pytest.mark.asyncio
+async def test_exhausted_final_output_retries_are_classified(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    conversation_id = uuid4()
+    invalid_final_steps = tuple(
+        FakeToolCallStep(
+            tool_name="workspace.list",
+            arguments={"path": "."},
+            tool_call_id=f"hidden-tool-{index}",
+        )
+        for index in range(3)
+    )
+    service, providers = _runtime(
+        database,
+        FakeScript(steps=(*_exploration_steps(), *invalid_final_steps)),
+        tool_names=("workspace.list",),
+        max_steps=20,
+    )
+    try:
+        with pytest.raises(ModelOutputError, match="after 3 attempts"):
+            await service.run(
+                RunRequest(
+                    prompt="inspect then summarize",
+                    workspace=tmp_path,
+                    conversation_id=conversation_id,
+                    lease=CapabilityLease(filesystem_read=(".",)),
+                    budget=_final_window_budget(),
+                )
+            )
+    finally:
+        await providers.aclose()
+
+    async with database.session() as session:
+        row = await session.scalar(select(RunRow).where(RunRow.conversation_id == conversation_id))
+        assert row is not None
+        events = await EventStore(session).list_for_run(row.id)
+    assert row.status == "failed"
+    assert events[-1].event_type is EventType.RUN_FAILED
+    assert isinstance(events[-1].payload, ErrorPayload)
+    assert events[-1].payload.code == "model_output_invalid"
 
 
 @pytest.mark.asyncio

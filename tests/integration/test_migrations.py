@@ -30,6 +30,13 @@ def test_initial_migration_creates_constraints_indexes_and_append_only_triggers(
         event_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list('run_events')").fetchall()
         }
+        delegation_indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list('agent_delegations')").fetchall()
+        }
+        message_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list('messages')").fetchall()
+        }
     finally:
         connection.close()
 
@@ -43,6 +50,10 @@ def test_initial_migration_creates_constraints_indexes_and_append_only_triggers(
         "artifacts",
         "memory_items",
         "memory_fts",
+        "agent_delegations",
+        "agents",
+        "conversations",
+        "messages",
     } <= tables
     assert {
         "trg_run_events_no_update",
@@ -53,6 +64,8 @@ def test_initial_migration_creates_constraints_indexes_and_append_only_triggers(
     } <= triggers
     assert {"ix_runs_conversation_id", "ix_runs_parent_run_id"} <= run_indexes
     assert "ix_run_events_run_occurred" in event_indexes
+    assert "ix_agent_delegations_parent_status" in delegation_indexes
+    assert "ix_messages_conversation_run" in message_indexes
 
 
 def test_initial_migration_can_downgrade_and_upgrade_again(
@@ -78,6 +91,10 @@ def test_initial_migration_can_downgrade_and_upgrade_again(
     assert "artifacts" not in tables_after_downgrade
     assert "memory_items" not in tables_after_downgrade
     assert "memory_fts" not in tables_after_downgrade
+    assert "agent_delegations" not in tables_after_downgrade
+    assert "agents" not in tables_after_downgrade
+    assert "conversations" not in tables_after_downgrade
+    assert "messages" not in tables_after_downgrade
 
     command.upgrade(migrated_alembic_config, "head")
     connection = sqlite3.connect(database_path)
@@ -99,6 +116,10 @@ def test_initial_migration_can_downgrade_and_upgrade_again(
         "artifacts",
         "memory_items",
         "memory_fts",
+        "agent_delegations",
+        "agents",
+        "conversations",
+        "messages",
     } <= tables_after_upgrade
 
 

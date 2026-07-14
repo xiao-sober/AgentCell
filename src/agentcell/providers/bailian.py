@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.alibaba import AlibabaProvider
 
 from agentcell.errors import ProviderConfigurationError
@@ -46,6 +47,7 @@ class BailianProviderAdapter:
         settings = OpenAIChatModelSettings(
             max_tokens=spec.max_output_tokens,
             timeout=spec.timeout_seconds,
+            parallel_tool_calls=False,
             extra_body=extra_body,
         )
         if spec.temperature is not None:
@@ -56,4 +58,13 @@ class BailianProviderAdapter:
             base_url=str(spec.base_url) if spec.base_url is not None else None,
             http_client=http_client,
         )
-        return OpenAIChatModel(spec.model, provider=provider, settings=settings)
+        profile = OpenAIModelProfile(
+            **(provider.model_profile(spec.model) or {}),
+            openai_chat_supports_max_completion_tokens=False,
+        )
+        return OpenAIChatModel(
+            spec.model,
+            provider=provider,
+            profile=profile,
+            settings=settings,
+        )

@@ -195,6 +195,16 @@ class ToolApprovalRequiredError(ToolError):
         super().__init__(f"Tool {tool_name!r} requires approval")
 
 
+class ToolCallDeferredError(ToolError):
+    """Raised when a tool has durable external work that must resume later."""
+
+    code = "tool_call_deferred"
+
+    def __init__(self, metadata: dict[str, object]) -> None:
+        self.metadata = metadata
+        super().__init__("Tool call is waiting for durable external work")
+
+
 class ToolForbiddenError(ToolError):
     """Raised when policy marks a tool as unconditionally forbidden."""
 
@@ -310,6 +320,15 @@ class WorkspaceStateConflictError(WorkspacePathError):
         super().__init__(f"Workspace file {path!r} changed since it was read or approved")
 
 
+class ChangeConflictError(WorkspacePathError):
+    """Raised when safe reconciliation or rollback would overwrite newer state."""
+
+    code = "change_conflict"
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"File change for {path!r} conflicts with the current workspace state")
+
+
 class ShellError(ToolError):
     """Base class for bounded subprocess execution failures."""
 
@@ -356,6 +375,28 @@ class DomainError(AgentCellError):
     code = "domain_error"
 
 
+class ConversationError(DomainError):
+    """Base class for scoped multi-turn Conversation failures."""
+
+    code = "conversation_error"
+
+
+class ConversationNotFoundError(ConversationError):
+    code = "conversation_not_found"
+
+    def __init__(self, conversation_id: str) -> None:
+        self.conversation_id = conversation_id
+        super().__init__(f"Conversation {conversation_id!r} was not found")
+
+
+class ConversationConflictError(ConversationError):
+    code = "conversation_conflict"
+
+
+class ConversationScopeError(ConversationError):
+    code = "conversation_scope_mismatch"
+
+
 class InvalidStateTransitionError(DomainError):
     """Raised when a Run attempts a transition outside the lifecycle table."""
 
@@ -383,6 +424,18 @@ class RunExecutionError(AgentCellError):
 
     def __init__(self, message: str = "Run execution failed") -> None:
         super().__init__(message)
+
+
+class ModelOutputError(AgentCellError):
+    """Raised when the model exhausts its bounded final-output retries."""
+
+    code = "model_output_invalid"
+
+    def __init__(self, attempts: int) -> None:
+        self.attempts = attempts
+        super().__init__(
+            f"Model did not produce an acceptable final response after {attempts} attempts"
+        )
 
 
 class ApprovalError(DomainError):
@@ -522,6 +575,24 @@ class StorageError(AgentCellError):
     """Base class for classified persistence failures."""
 
     code = "storage_error"
+
+
+class ChangeNotFoundError(StorageError):
+    """Raised when a persisted FileChange identifier is unknown."""
+
+    code = "change_not_found"
+
+    def __init__(self, change_id: str) -> None:
+        super().__init__(f"File change {change_id!r} was not found")
+
+
+class DelegationNotFoundError(StorageError):
+    """Raised when a durable Agent delegation cannot be found."""
+
+    code = "delegation_not_found"
+
+    def __init__(self, delegation_id: str) -> None:
+        super().__init__(f"Delegation {delegation_id!r} was not found")
 
 
 class CheckpointNotFoundError(StorageError):

@@ -11,12 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agentcell.budgets import BudgetSnapshot
 from agentcell.events import JsonValue
 from agentcell.kernel.lifecycle import RunStatus
-from agentcell.policy import CapabilityLease
+from agentcell.policy import CapabilityLease, PermissionMode
 
 
 class CheckpointKind(StrEnum):
     APPROVAL = "approval"
     BRANCH = "branch"
+    DELEGATION = "delegation"
+    HANDOFF = "handoff"
 
 
 class Checkpoint(BaseModel):
@@ -33,13 +35,18 @@ class Checkpoint(BaseModel):
     prompt: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
     lease: CapabilityLease
+    permission_mode: PermissionMode = PermissionMode.REQUEST
     budget: BudgetSnapshot
     messages: list[JsonValue]
     pending_approval_ids: tuple[UUID, ...] = ()
+    pending_delegation_ids: tuple[UUID, ...] = ()
+    child_run_ids: tuple[UUID, ...] = ()
+    workflow_state: dict[str, JsonValue] | None = None
     temporary_approved_tools: frozenset[str] = frozenset()
     artifact_ids: tuple[UUID, ...] = ()
     run_status: RunStatus
     parent_run_id: UUID | None = None
+    depth: int = Field(default=0, ge=0, strict=True)
     source_run_id: UUID | None = None
     source_sequence: int | None = Field(default=None, ge=1, strict=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

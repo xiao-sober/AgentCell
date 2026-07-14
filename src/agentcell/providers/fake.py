@@ -33,6 +33,7 @@ from agentcell.providers.models import (
     ModelUsage,
     ProviderName,
 )
+from agentcell.providers.tool_names import portable_tool_name
 
 
 class FakeTextStep(BaseModel):
@@ -151,7 +152,7 @@ class FakeProviderAdapter:
             messages: list[ModelMessage],
             agent_info: AgentInfo,
         ) -> ModelResponse:
-            del messages, agent_info
+            del messages
             step = cursor.next_step(model=spec.model)
             if isinstance(step, FakeFailureStep):
                 raise _fake_failure(step.failure, model=spec.model)
@@ -161,10 +162,11 @@ class FakeProviderAdapter:
                     usage=step.usage.to_request_usage(),
                     finish_reason="stop",
                 )
+            tool_name = _resolve_script_tool_name(step.tool_name, agent_info)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        step.tool_name,
+                        tool_name,
                         step.arguments,
                         step.tool_call_id,
                     )
@@ -177,7 +179,7 @@ class FakeProviderAdapter:
             messages: list[ModelMessage],
             agent_info: AgentInfo,
         ) -> AsyncIterator[str | DeltaToolCalls]:
-            del messages, agent_info
+            del messages
             step = cursor.next_step(model=spec.model)
             if isinstance(step, FakeFailureStep):
                 raise _fake_failure(step.failure, model=spec.model)
@@ -185,9 +187,10 @@ class FakeProviderAdapter:
                 for chunk in step.stream_chunks():
                     yield chunk
                 return
+            tool_name = _resolve_script_tool_name(step.tool_name, agent_info)
             yield {
                 0: DeltaToolCall(
-                    name=step.tool_name,
+                    name=tool_name,
                     json_args=json.dumps(step.arguments, ensure_ascii=False, separators=(",", ":")),
                     tool_call_id=step.tool_call_id,
                 )
@@ -198,6 +201,14 @@ class FakeProviderAdapter:
             stream_function=request_stream,
             model_name=spec.model,
         )
+
+
+def _resolve_script_tool_name(name: str, agent_info: AgentInfo) -> str:
+    available = {tool.name for tool in agent_info.function_tools}
+    if name in available:
+        return name
+    alias = portable_tool_name(name)
+    return alias if alias in available else name
 
 
 def _fake_failure(kind: FakeFailureKind, *, model: str) -> ProviderError:

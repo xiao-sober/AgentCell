@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from agentcell.agents import AgentRegistry, coordinator_spec
 from agentcell.budgets import Budget, BudgetTracker
 from agentcell.events import (
     EventType,
@@ -19,8 +20,17 @@ from agentcell.kernel.checkpoint import Checkpoint, CheckpointKind
 from agentcell.kernel.lifecycle import RunStatus
 from agentcell.kernel.models import Run
 from agentcell.kernel.replay import ReplayService
+from agentcell.kernel.run_service import RunService
 from agentcell.policy import CapabilityLease
+from agentcell.providers import (
+    FakeModelSpec,
+    FakeProviderAdapter,
+    FakeScript,
+    FakeTextStep,
+    ProviderFactory,
+)
 from agentcell.storage import CheckpointRepository, Database, EventStore, RunRepository
+from agentcell.tools import ToolRegistry, register_workspace_tools
 
 
 def _budget() -> Budget:
@@ -163,3 +173,28 @@ async def test_branch_references_only_requested_source_prefix(
     assert checkpoint.source_run_id == source.id
     assert checkpoint.source_sequence == 3
     assert checkpoint.run_status is RunStatus.PAUSED
+
+    model = FakeModelSpec(model="branch-resume")
+    providers = ProviderFactory(
+        {"fake": model},
+        adapters=(
+            FakeProviderAdapter(
+                {model.model: FakeScript(steps=(FakeTextStep(text="branched result"),))}
+            ),
+        ),
+    )
+    tools = ToolRegistry()
+    register_workspace_tools(tools)
+    service = RunService(
+        database=database,
+        providers=providers,
+        agents=AgentRegistry((coordinator_spec(model_ref="fake"),)),
+        tools=tools,
+    )
+    try:
+        resumed = await service.resume_paused(child.id)
+    finally:
+        await providers.aclose()
+
+    assert resumed.run.status is RunStatus.COMPLETED
+    assert resumed.output == "branched result"

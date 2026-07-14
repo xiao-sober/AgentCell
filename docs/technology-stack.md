@@ -76,8 +76,8 @@ uv run python -m pytest
 
 | 技术 | 当前状态 | 在 AgentCell 中的作用 | 使用边界 | 官方资料 |
 | --- | --- | --- | --- | --- |
-| FastAPI | 后续阶段 | 暴露 Runs、Agents、Memories、Tools、Health 等 HTTP API，负责参数解析、依赖注入、OpenAPI 和统一错误响应。 | 路由不得编排业务流程；必须调用 RunService，不能直接操作 ORM、预算或状态字符串。 | [FastAPI 文档](https://fastapi.tiangolo.com/) |
-| Uvicorn | 后续阶段 | 作为 ASGI Server 运行 FastAPI，承载 HTTP、SSE 和应用生命周期。 | 它是进程/协议服务器，不是业务框架；超时、代理头、监听地址和 worker 策略必须通过部署配置管理。 | [Uvicorn 文档](https://www.uvicorn.org/) |
+| FastAPI | 阶段 9 起 | 暴露 Runs、Agents、Memories、Providers、Tools、Health 等 HTTP API，负责参数解析、依赖注入、OpenAPI 和统一错误响应。 | 路由不得编排业务流程；必须调用应用服务，不能直接操作 ORM、预算或状态字符串。 | [FastAPI 文档](https://fastapi.tiangolo.com/) |
+| Uvicorn | 阶段 9 起 | 作为 ASGI Server 运行 FastAPI，承载 HTTP、SSE 和应用生命周期。 | 它是进程/协议服务器，不是业务框架；超时、代理头、监听地址和 worker 策略必须通过部署配置管理。 | [Uvicorn 文档](https://www.uvicorn.org/) |
 | `pydantic-ai-slim` | 已接入 | 提供模型调用、Agent Loop、Function Calling、工具参数校验、流式模型事件、结构化结果、基础重试、Usage 和委派基础能力。使用 slim 版本控制不需要的 Provider 依赖。 | 不重复实现其模型协议；AgentCell 仍负责 Run 生命周期、事件、预算、审批、恢复、记忆和 Provider 工程。Provider 专有参数不能泄露到 Agent 代码。 | [PydanticAI 安装](https://pydantic.dev/docs/ai/overview/install/) |
 | Pydantic v2 | 已接入 | 表达领域事件、Run、预算、Provider 配置、工具参数、API DTO 和持久化 JSON Schema；统一验证、序列化、UUID、UTC 和 Decimal。 | ORM 模型不能冒充领域模型；跨边界数据禁止无约束 `dict` 和静默额外字段。 | [Pydantic 文档](https://pydantic.dev/docs/validation/latest/) |
 | pydantic-settings | 已接入 | 从环境变量和配置文件加载应用、Provider、模型、数据库和安全配置，并生成可验证的 Settings。 | API Key 只能从环境变量或 Secret Resolver 读取；不得返回给 API、写入数据库或放入模型上下文。 | [Settings Management](https://pydantic.dev/docs/validation/latest/concepts/pydantic_settings/) |
@@ -116,10 +116,10 @@ Alembic ──负责──> SQLite Schema 的版本演进
 
 | 技术 | 当前状态 | 在 AgentCell 中的作用 | 使用边界 | 官方资料 |
 | --- | --- | --- | --- | --- |
-| Typer | 后续阶段 | 构建 `agentcell run/chat/serve/inspect/replay/branch` 等类型化 CLI 命令。 | CLI 直接调用 RunService，不通过 HTTP 调用本机 FastAPI；命令必须返回有意义的退出码。 | [Typer 文档](https://typer.tiangolo.com/) |
-| Rich | 后续阶段 | 展示流式文本、表格、Diff、审批、进度、错误和 JSON 之外的人类可读 CLI 输出。 | 只负责终端渲染，不在 Rich 组件中保存业务状态；`--json` 模式不得混入装饰文本。 | [Rich 文档](https://rich.readthedocs.io/en/stable/) |
+| Typer | 阶段 5 起 | 构建 `agentcell run/serve/inspect/replay/branch/resume` 和资源子命令。 | CLI 直接调用应用服务，不通过 HTTP 调用本机 FastAPI；命令必须返回有意义的退出码。 | [Typer 文档](https://typer.tiangolo.com/) |
+| Rich | 阶段 5 起 | 展示结果、审批、错误和 JSON 之外的人类可读 CLI 输出。 | 只负责终端渲染，不在 Rich 组件中保存业务状态；`--json` 模式不得混入装饰文本。 | [Rich 文档](https://rich.readthedocs.io/en/stable/) |
 | Tenacity | 按需 | 仅在 PydanticAI 未覆盖的边界为幂等操作提供退避、停止条件和重试回调。 | 不作为全局“自动重试一切”的装饰器；401/403、参数错误、上下文超限及非幂等工具默认不重试。 | [Tenacity 文档](https://tenacity.readthedocs.io/en/latest/) |
-| OpenTelemetry | 后续阶段 | 记录 Provider 延迟、首 Token 时间、工具耗时、重试、HTTP 请求和父子 Agent Trace。 | Span 是技术追踪，不是业务审计；不得记录密钥、完整敏感参数或原始思维链。 | [OpenTelemetry Python](https://opentelemetry.io/docs/languages/python/) |
+| OpenTelemetry | 阶段 8 起 | 阶段 8 使用 API 建立父子 Agent/Handoff Span；后续补 Provider 延迟、首 Token、工具、重试、SDK、Exporter 和采样。 | Span 是技术追踪，不是业务审计；不得记录密钥、完整敏感参数或原始思维链。 | [OpenTelemetry Python](https://opentelemetry.io/docs/languages/python/) |
 | structlog | 待决策 | 候选结构化日志方案，便于绑定 `trace_id/run_id/agent_id/provider/model/event_type` 和统一处理器。 | 若选择 structlog，项目业务代码不再并行维护另一套标准库格式化约定。 | [structlog 文档](https://www.structlog.org/en/stable/) |
 | 标准库 logging | 待决策 | 零额外依赖的候选日志方案，可通过 Adapter、Filter、Formatter 或 LogRecord factory 实现结构化上下文。 | 与 structlog 二选一；决定后项目只保留一套日志调用规范。 | [Python logging](https://docs.python.org/3/library/logging.html) |
 
@@ -162,8 +162,8 @@ uv run alembic check
 | --- | --- | --- | --- | --- |
 | TanStack Query | 后续阶段 | 管理 Runs、Agents、Memories、Providers 等服务端状态的请求、缓存、失效、重试、loading/error 和取消。 | 服务端数据不复制进 Zustand；请求重试必须尊重操作幂等性，审批和写操作不能盲目自动重试。 | [TanStack Query 文档](https://tanstack.com/query/latest/docs/framework/react/overview) |
 | Zustand | 按需 | 仅保存确有必要的跨页面本地状态，例如界面偏好、临时面板选择或不属于服务端的交互状态。 | Run、预算、审批、Provider 和记忆数据归 TanStack Query/SSE；不在 localStorage 中保存 API Key。没有真实跨页需求时不引入。 | [Zustand 文档](https://zustand.docs.pmnd.rs/)、[官方仓库](https://github.com/pmndrs/zustand) |
-| AG-UI | 后续阶段 | 作为 Agent 与用户界面之间的开放事件协议，表达文本增量、工具、审批、中断、状态和子 Agent 等实时交互。 | AgentCell 领域事件先持久化，再映射为 AG-UI；不能让协议事件直接修改数据库状态。不要暴露原始思维链。 | [AG-UI 文档](https://docs.ag-ui.com/introduction)、[协议仓库](https://github.com/ag-ui-protocol/ag-ui) |
-| SSE | 后续阶段 | 作为服务器到浏览器的单向实时传输，承载 AG-UI 映射后的增量事件，并通过 sequence/Last-Event-ID 续传。 | SSE 是传输方式，不是事件 Schema；审批、取消、恢复等客户端命令仍通过 HTTP POST。首版不为普通流式输出引入 WebSocket。 | [MDN Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) |
+| AG-UI | 阶段 9 起 | 使用官方 Python 事件模型和 EventEncoder 表达文本、工具、Run 终态及命名 CUSTOM 领域事件。 | AgentCell 领域事件先持久化，再映射为 AG-UI；不能让协议事件直接修改数据库状态。不要暴露原始思维链。 | [AG-UI 文档](https://docs.ag-ui.com/introduction)、[协议仓库](https://github.com/ag-ui-protocol/ag-ui) |
+| SSE | 阶段 9 起 | 承载 AG-UI 映射事件，并通过复合 `sequence.offset` ID 与 Last-Event-ID 精确续传。 | SSE 是传输方式，不是事件 Schema；审批、取消、恢复等客户端命令仍通过 HTTP POST。首版不为普通流式输出引入 WebSocket。 | [MDN Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) |
 | Vitest | 后续阶段 | 运行前端工具函数、hooks、状态映射和组件行为的快速单元/组件测试，并复用 Vite 配置。 | 不用组件单测替代用户关键路径 E2E；涉及时间和流式事件时使用确定性 fixture。 | [Vitest 指南](https://vitest.dev/guide/) |
 | Playwright | 后续阶段 | 验证创建任务、流式输出、工具审批、时间线、取消、恢复和记忆等浏览器 E2E，并检查布局与控制台错误。 | E2E 使用隔离数据库和 Fake Provider；不得默认调用真实模型或复用生产数据。 | [Playwright 文档](https://playwright.dev/docs/intro) |
 
@@ -206,8 +206,13 @@ AgentCell DomainEvent
 2. **阶段 3，Provider 工程**：`pydantic-ai-slim`、pydantic-settings、HTTPX；Tenacity 仅在确认缺口后按需加入；
 3. **阶段 5，CLI 闭环**：Typer、Rich；
 4. **阶段 9，产品接口**：FastAPI、Uvicorn、AG-UI/SSE 映射；
-5. **阶段 10，Web 工作台**：React、TypeScript、Vite、pnpm、TanStack Query、Vitest、Playwright；Zustand 按真实状态需求决定；
-6. **阶段 11，可观测性**：OpenTelemetry，并在 structlog 与标准库 logging 之间作出单一选择。
+5. **阶段 9.1，会话线程**：复用 SQLAlchemy、Alembic、PydanticAI 消息历史、现有上下文压缩、FastAPI 和 Typer，不引入新的会话框架；
+6. **阶段 9.2，CLI 执行闭环**：复用 Typer、Rich、现有 EventStore、PolicyEngine、CapabilityLease、审批检查点和 Artifact Store；新增 ChangeSet/FileChange 持久化。Git 增强通过受控 subprocess argv 调用本机 Git，不引入 GitPython，不直接读取 `.git`，Git 不可用时核心审计与回滚仍工作；
+7. **阶段 9.2.1，正确性收口**：不引入新的大型依赖，复用现有 Kernel、Policy、PydanticAI 重试、SQLite 和测试设施；
+8. **阶段 9.2.2，CLI 产品化**：复用 Typer/Rich，新增纯展示投影和 Rich Live，不引入第二套终端 UI 框架；
+9. **阶段 9.3，确定性 Team**：复用现有 Handoff、父子 Run、预算和检查点，不引入工作流框架；
+10. **阶段 10–10.1，Web 工作台与管理补全**：React、TypeScript、Vite、pnpm、TanStack Query、Vitest、Playwright；Zustand 按真实状态需求决定；
+11. **阶段 11，可观测性与交付加固**：OpenTelemetry，并在 structlog 与标准库 logging 之间作出单一选择；同时完成存储保留、高级 Git 和独立回滚 Run。
 
 阶段编号以 `docs/development-steps.md` 为准。如果实际垂直切片需要调整顺序，必须在 handoff 中说明原因。
 

@@ -78,8 +78,11 @@ max_retries = 3
 - 百炼 OpenAI-compatible Chat API 用 `extra_body` 传递 `enable_thinking` 和 `thinking_budget`；
 - `qwen3.7-plus` 支持混合思考模式；
 - DeepSeek V4 用 `thinking.type` 开关思考模式，只接受 `high` 或 `max` 作为原生推理强度；
+- 两家适配器按官方 Chat Completion 字段发送 `max_tokens`；百炼显式关闭并行工具调用，避免只读项目检查一次生成过大的工具批次；DeepSeek 不发送未在官方工具示例中使用的可选并行参数；
+- DeepSeek V4 思考模式可接收工具定义，但会拒绝 `tool_choice`；专用 Chat Model 只在 DeepSeek 适配器内省略该字段，并保留 PydanticAI 对后续轮次 `reasoning_content` 的回传；
+- AgentCell 的领域工具名继续使用 `workspace.list` 这类稳定名称；发送给模型前统一映射为 `workspace_list` 形式的可移植别名，以满足 DeepSeek 对函数名只能包含字母、数字、下划线和短横线的限制。工具执行、事件、审批和检查点仍保存原领域名称；
 - DeepSeek 思考模式不使用 temperature、top_p、presence_penalty 或 frequency_penalty，本项目在配置期拒绝思考模式下的 temperature；
-- 两家 Provider 的 Usage 统一通过 PydanticAI `RequestUsage` / `RunUsage` 转换，不在 Agent 代码中解析厂商响应字段。
+- 两家 Provider 的 Usage 统一通过 PydanticAI `RequestUsage` / `RunUsage` 转换，不在 Agent 代码中解析厂商响应字段。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 是 Chat Completion Usage 顶层扩展字段：专用适配器在非流式响应和流式最终 usage-only chunk 中统一把命中量映射为 `cache_read_tokens`，同时在 details 中保留两项原始计数；缓存未命中量不等同于可观测的缓存写入量，因此不会写入 `cache_write_tokens`。
 
 官方资料：
 
@@ -104,7 +107,7 @@ max_retries = 3
 
 ## 6. 错误与重试
 
-Provider 响应会被转换为 AgentCell 的安全异常。异常只保留 Provider、模型名、状态码和通用说明，不保留响应体、请求头、API Key 或完整请求内容。
+Provider 响应会被转换为 AgentCell 的安全异常。异常只保留 Provider、模型名、状态码和通用说明，不保留响应体、请求头、API Key 或完整请求内容。普通协议拒绝会显示安全的 HTTP 状态码，便于区分请求 Schema 问题和认证、限流或上游错误。
 
 | 场景 | 错误 | 默认可重试 |
 | --- | --- | --- |
@@ -139,4 +142,25 @@ $env:DEEPSEEK_API_KEY="..."
 uv run pytest tests/provider_contract/test_live_providers.py
 ```
 
+该文件同时覆盖非流式纯文本、流式纯文本与一次真实 Function Calling。排查“文本可用但 Agent 工具请求被拒绝”时，应至少运行：
+
+```powershell
+uv run pytest tests/provider_contract/test_live_providers.py -k function_calling -vv
+```
+
+排查流式 SSE 或 Usage 映射时运行：
+
+```powershell
+uv run pytest tests/provider_contract/test_live_providers.py -k streaming -vv
+```
+
 仅配置 API Key 不会发起真实请求。CI 默认不得打开该开关。
+
+## 9. 阶段 9.2.1 真实运行回归
+
+真实运行已暴露两个必须由公共运行时修复、而不是厂商条件分支掩盖的问题：
+
+- DeepSeek 可能把未解析 DSML 工具协议作为普通文本返回。若文本主体是 `<｜｜DSML｜｜tool_calls>`、`invoke`、未完成 Function Call 或继续调用不存在的 `artifact_list`，FinalOutputGuard 必须在 `run.completed` 前拒绝；运行时不得从该文本直接执行工具。先保证压缩摘要、真实工具目录和最终无工具重试一致；只有测试证明必须重新读取已引用大内容时，才增加受当前 Run/Conversation 引用范围约束的 `artifact.load`。一次预算内最终回答重试仍失败时返回 `invalid_final_output`。
+- Qwen 可能为 `workspace.read` 自行估算 byte offset，并落在中文 UTF-8 continuation byte。读取器必须对齐合法边界并返回 requested/actual/next offset，不能把合法文件误报为 binary；真实非法字节仍拒绝。阶段 9.2.1 先完成兼容修复，只有实际出现文件版本竞争时再增加绑定哈希的 opaque Cursor。一次有界工具参数纠正后仍失败才终止 Run。
+
+离线契约测试使用固定响应和 UTF-8 字节夹具覆盖上述路径；真实 Provider 冒烟测试只在显式开关下运行，并断言 Usage、事件、预算和终态均正确。公共 Kernel、Tool 和 FinalOutputGuard 只根据协议与数据形态判断，不得出现 DeepSeek/Qwen 名称分支。

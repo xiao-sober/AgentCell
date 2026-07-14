@@ -14,10 +14,22 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agentcell.agents import AgentDelegation, AgentSpec, DelegationStatus
+from agentcell.changes.models import ChangeSet, FileChange
+from agentcell.conversations.models import (
+    Conversation,
+    ConversationMessage,
+    ConversationMessageKind,
+)
 from agentcell.errors import (
+    AgentRegistrationError,
     ApprovalNotFoundError,
+    ChangeNotFoundError,
     CheckpointNotFoundError,
     ConfigurationError,
+    ConversationConflictError,
+    ConversationNotFoundError,
+    DelegationNotFoundError,
     EventPayloadTooLargeError,
     EventPayloadTypeError,
     InvalidEventCursorError,
@@ -42,9 +54,15 @@ from agentcell.memory.models import MemoryItem, MemoryKind, MemoryScope
 from agentcell.policy import Approval, ApprovalStatus
 from agentcell.storage.database import Database
 from agentcell.storage.tables import (
+    AgentDelegationRow,
+    AgentSpecRow,
     ApprovalRow,
     ArtifactRow,
+    ChangeSetRow,
     CheckpointRow,
+    ConversationMessageRow,
+    ConversationRow,
+    FileChangeRow,
     MemoryItemRow,
     RunEventRow,
     RunRow,
@@ -54,6 +72,51 @@ from agentcell.tools import ToolCall, ToolResult
 from agentcell.tools.artifacts import ArtifactMetadata
 
 MAX_INLINE_EVENT_PAYLOAD_BYTES = 64 * 1_024
+
+
+class AgentSpecRepository:
+    """Persist user-managed Agent declarations independently of built-ins."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, spec: AgentSpec) -> AgentSpec:
+        now = datetime.now(UTC)
+        self._session.add(
+            AgentSpecRow(
+                id=spec.id,
+                data=spec.model_dump(mode="json"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            raise AgentRegistrationError(f"Agent {spec.id!r} is already persisted") from exc
+        return spec
+
+    async def save(self, spec: AgentSpec) -> AgentSpec:
+        now = datetime.now(UTC)
+        row = await self._session.get(AgentSpecRow, spec.id)
+        if row is None:
+            self._session.add(
+                AgentSpecRow(
+                    id=spec.id,
+                    data=spec.model_dump(mode="json"),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.data = spec.model_dump(mode="json")
+            row.updated_at = now
+        await self._session.flush()
+        return spec
+
+    async def list(self) -> list[AgentSpec]:
+        rows = (await self._session.scalars(select(AgentSpecRow).order_by(AgentSpecRow.id))).all()
+        return [AgentSpec.model_validate(row.data) for row in rows]
 
 
 class RunRepository:
@@ -127,6 +190,200 @@ class RunRepository:
                 "created_at": row.created_at,
                 "updated_at": row.updated_at,
             }
+        )
+
+
+class ConversationRepository:
+    """Persist scoped threads and atomically guard their single active root Run."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, conversation: Conversation) -> Conversation:
+        self._session.add(
+            ConversationRow(
+                id=conversation.id,
+                user_id=conversation.user_id,
+                project_id=conversation.project_id,
+                workspace=conversation.workspace,
+                agent_id=conversation.agent_id,
+                title=conversation.title,
+                active_run_id=conversation.active_run_id,
+                next_message_sequence=1,
+                created_at=conversation.created_at,
+                updated_at=conversation.updated_at,
+            )
+        )
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            raise StorageIntegrityError(f"Could not create Conversation {conversation.id}") from exc
+        return conversation
+
+    async def get(self, conversation_id: UUID) -> Conversation | None:
+        row = await self._session.get(ConversationRow, conversation_id)
+        return None if row is None else self._to_domain(row)
+
+    async def get_required(self, conversation_id: UUID) -> Conversation:
+        conversation = await self.get(conversation_id)
+        if conversation is None:
+            raise ConversationNotFoundError(str(conversation_id))
+        return conversation
+
+    async def list_for_user(self, user_id: UUID, *, limit: int = 100) -> list[Conversation]:
+        rows = (
+            await self._session.scalars(
+                select(ConversationRow)
+                .where(ConversationRow.user_id == user_id)
+                .order_by(ConversationRow.updated_at.desc())
+                .limit(limit)
+            )
+        ).all()
+        return [self._to_domain(row) for row in rows]
+
+    async def claim(self, conversation_id: UUID, run_id: UUID) -> Conversation:
+        conversation = await self.get_required(conversation_id)
+        if conversation.active_run_id is not None:
+            active = await self._session.get(RunRow, conversation.active_run_id)
+            if active is None or active.status in {"completed", "failed", "cancelled"}:
+                await self._session.execute(
+                    update(ConversationRow)
+                    .where(
+                        ConversationRow.id == conversation_id,
+                        ConversationRow.active_run_id == conversation.active_run_id,
+                    )
+                    .values(active_run_id=None)
+                )
+            else:
+                raise ConversationConflictError(
+                    f"Conversation {conversation_id} already has active Run "
+                    f"{conversation.active_run_id}"
+                )
+        now = datetime.now(UTC)
+        result = await self._session.execute(
+            update(ConversationRow)
+            .where(
+                ConversationRow.id == conversation_id,
+                ConversationRow.active_run_id.is_(None),
+            )
+            .values(active_run_id=run_id, updated_at=now)
+            .returning(ConversationRow.id)
+        )
+        if result.scalar_one_or_none() is None:
+            raise ConversationConflictError(
+                f"Conversation {conversation_id} already has an active Run"
+            )
+        claimed = await self.get_required(conversation_id)
+        return claimed
+
+    async def release(self, conversation_id: UUID, run_id: UUID) -> None:
+        await self._session.execute(
+            update(ConversationRow)
+            .where(
+                ConversationRow.id == conversation_id,
+                ConversationRow.active_run_id == run_id,
+            )
+            .values(active_run_id=None, updated_at=datetime.now(UTC))
+        )
+
+    @staticmethod
+    def _to_domain(row: ConversationRow) -> Conversation:
+        return Conversation(
+            id=row.id,
+            user_id=row.user_id,
+            project_id=row.project_id,
+            workspace=row.workspace,
+            agent_id=row.agent_id,
+            title=row.title,
+            active_run_id=row.active_run_id,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+
+class ConversationMessageRepository:
+    """Append and query authoritative sanitized Conversation messages."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(
+        self,
+        *,
+        conversation_id: UUID,
+        run_id: UUID,
+        kind: ConversationMessageKind,
+        payload: dict[str, JsonValue],
+        artifact_ids: tuple[UUID, ...] = (),
+    ) -> ConversationMessage:
+        next_sequence = await self._session.scalar(
+            update(ConversationRow)
+            .where(ConversationRow.id == conversation_id)
+            .values(
+                next_message_sequence=ConversationRow.next_message_sequence + 1,
+                updated_at=datetime.now(UTC),
+            )
+            .returning(ConversationRow.next_message_sequence)
+        )
+        if next_sequence is None:
+            raise ConversationNotFoundError(str(conversation_id))
+        message = ConversationMessage(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            sequence=next_sequence - 1,
+            kind=kind,
+            payload=payload,
+            artifact_ids=artifact_ids,
+        )
+        self._session.add(
+            ConversationMessageRow(
+                id=message.id,
+                conversation_id=message.conversation_id,
+                run_id=message.run_id,
+                sequence=message.sequence,
+                kind=message.kind.value,
+                payload_version=message.payload_version,
+                payload=message.payload,
+                artifact_ids=[str(item) for item in message.artifact_ids],
+                created_at=message.created_at,
+            )
+        )
+        await self._session.flush()
+        return message
+
+    async def list_for_conversation(
+        self,
+        conversation_id: UUID,
+        *,
+        completed_only: bool = False,
+        limit: int = 500,
+    ) -> list[ConversationMessage]:
+        statement = (
+            select(ConversationMessageRow)
+            .where(ConversationMessageRow.conversation_id == conversation_id)
+            .order_by(ConversationMessageRow.sequence.desc())
+            .limit(limit)
+        )
+        if completed_only:
+            statement = statement.join(RunRow, RunRow.id == ConversationMessageRow.run_id).where(
+                RunRow.status == "completed"
+            )
+        rows = list((await self._session.scalars(statement)).all())
+        rows.reverse()
+        return [self._to_domain(row) for row in rows]
+
+    @staticmethod
+    def _to_domain(row: ConversationMessageRow) -> ConversationMessage:
+        return ConversationMessage(
+            id=row.id,
+            conversation_id=row.conversation_id,
+            run_id=row.run_id,
+            sequence=row.sequence,
+            kind=ConversationMessageKind(row.kind),
+            payload_version=row.payload_version,
+            payload=row.payload,
+            artifact_ids=tuple(UUID(item) for item in row.artifact_ids),
+            created_at=row.created_at,
         )
 
 
@@ -322,6 +579,19 @@ class ApprovalRepository:
             raise ApprovalNotFoundError(str(approval_id))
         return approval
 
+    async def find_by_provider_call(
+        self,
+        run_id: UUID,
+        provider_call_id: str,
+    ) -> Approval | None:
+        row = await self._session.scalar(
+            select(ApprovalRow).where(
+                ApprovalRow.run_id == run_id,
+                ApprovalRow.provider_call_id == provider_call_id,
+            )
+        )
+        return None if row is None else Approval.model_validate(row.data)
+
     async def list_for_run(
         self, run_id: UUID, *, status: ApprovalStatus | None = None
     ) -> list[Approval]:
@@ -453,6 +723,240 @@ class SqliteToolExecutionLedger:
             )
             if row is not None and row.status != "completed":
                 row.status = "failed"
+
+    async def complete_deferred(
+        self,
+        provider_call_id: str,
+        output: JsonValue,
+    ) -> ToolResult:
+        """Complete a durable external call before its PydanticAI continuation resumes."""
+
+        encoded = json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        async with self._database.transaction() as session:
+            row = await session.scalar(
+                select(ToolExecutionRow).where(
+                    ToolExecutionRow.run_id == self._run_id,
+                    ToolExecutionRow.provider_call_id == provider_call_id,
+                )
+            )
+            if row is None:
+                raise StorageIntegrityError("Deferred tool execution was not claimed")
+            result = ToolResult(
+                call_id=row.call_id,
+                tool_name=row.tool_name,
+                output=output,
+                output_bytes=len(encoded),
+                duration_ms=0,
+            )
+            row.status = "completed"
+            row.result = result.model_dump(mode="json")
+            row.completed_at = datetime.now(UTC)
+            return result
+
+
+class AgentDelegationRepository:
+    """Persist idempotent parent/child delegation projections."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, delegation: AgentDelegation) -> AgentDelegation:
+        self._session.add(
+            AgentDelegationRow(
+                id=delegation.id,
+                parent_run_id=delegation.parent_run_id,
+                child_run_id=delegation.child_run_id,
+                provider_call_id=delegation.provider_call_id,
+                target_agent_id=delegation.target_agent_id,
+                kind=delegation.kind.value,
+                status=delegation.status.value,
+                depth=delegation.depth,
+                data=delegation.model_dump(mode="json", exclude_computed_fields=True),
+                created_at=delegation.created_at,
+                updated_at=delegation.updated_at,
+            )
+        )
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise StorageIntegrityError("Could not create Agent delegation") from error
+        return delegation
+
+    async def get(self, delegation_id: UUID) -> AgentDelegation | None:
+        row = await self._session.get(AgentDelegationRow, delegation_id)
+        return None if row is None else AgentDelegation.model_validate(row.data)
+
+    async def get_required(self, delegation_id: UUID) -> AgentDelegation:
+        delegation = await self.get(delegation_id)
+        if delegation is None:
+            raise DelegationNotFoundError(str(delegation_id))
+        return delegation
+
+    async def find_by_parent_call(
+        self,
+        parent_run_id: UUID,
+        provider_call_id: str,
+    ) -> AgentDelegation | None:
+        row = await self._session.scalar(
+            select(AgentDelegationRow).where(
+                AgentDelegationRow.parent_run_id == parent_run_id,
+                AgentDelegationRow.provider_call_id == provider_call_id,
+            )
+        )
+        return None if row is None else AgentDelegation.model_validate(row.data)
+
+    async def find_by_child(self, child_run_id: UUID) -> AgentDelegation | None:
+        row = await self._session.scalar(
+            select(AgentDelegationRow).where(AgentDelegationRow.child_run_id == child_run_id)
+        )
+        return None if row is None else AgentDelegation.model_validate(row.data)
+
+    async def list_active_for_parent(self, parent_run_id: UUID) -> list[AgentDelegation]:
+        rows = await self._session.scalars(
+            select(AgentDelegationRow)
+            .where(
+                AgentDelegationRow.parent_run_id == parent_run_id,
+                AgentDelegationRow.status.in_(
+                    (
+                        DelegationStatus.PENDING.value,
+                        DelegationStatus.RUNNING.value,
+                        DelegationStatus.WAITING_APPROVAL.value,
+                    )
+                ),
+            )
+            .order_by(AgentDelegationRow.created_at)
+        )
+        return [AgentDelegation.model_validate(row.data) for row in rows]
+
+    async def list_for_parent(self, parent_run_id: UUID) -> list[AgentDelegation]:
+        rows = await self._session.scalars(
+            select(AgentDelegationRow)
+            .where(AgentDelegationRow.parent_run_id == parent_run_id)
+            .order_by(AgentDelegationRow.created_at)
+        )
+        return [AgentDelegation.model_validate(row.data) for row in rows]
+
+    async def save(self, delegation: AgentDelegation) -> AgentDelegation:
+        result = await self._session.execute(
+            update(AgentDelegationRow)
+            .where(AgentDelegationRow.id == delegation.id)
+            .values(
+                status=delegation.status.value,
+                data=delegation.model_dump(mode="json", exclude_computed_fields=True),
+                updated_at=delegation.updated_at,
+            )
+            .returning(AgentDelegationRow.id)
+        )
+        if result.scalar_one_or_none() is None:
+            raise DelegationNotFoundError(str(delegation.id))
+        return delegation
+
+
+class ChangeSetRepository:
+    """Persist one lazily-created ChangeSet per Run."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, value: ChangeSet) -> ChangeSet:
+        self._session.add(
+            ChangeSetRow(
+                id=value.id,
+                run_id=value.run_id,
+                status=value.status.value,
+                data=value.model_dump(mode="json"),
+                created_at=value.created_at,
+                completed_at=value.completed_at,
+            )
+        )
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise StorageIntegrityError("Could not create ChangeSet") from error
+        return value
+
+    async def get(self, change_set_id: UUID) -> ChangeSet | None:
+        row = await self._session.get(ChangeSetRow, change_set_id)
+        return None if row is None else ChangeSet.model_validate(row.data)
+
+    async def get_for_run(self, run_id: UUID) -> ChangeSet | None:
+        row = await self._session.scalar(select(ChangeSetRow).where(ChangeSetRow.run_id == run_id))
+        return None if row is None else ChangeSet.model_validate(row.data)
+
+    async def save(self, value: ChangeSet) -> ChangeSet:
+        result = await self._session.execute(
+            update(ChangeSetRow)
+            .where(ChangeSetRow.id == value.id)
+            .values(
+                status=value.status.value,
+                data=value.model_dump(mode="json"),
+                completed_at=value.completed_at,
+            )
+            .returning(ChangeSetRow.id)
+        )
+        if result.scalar_one_or_none() is None:
+            raise StorageIntegrityError("ChangeSet does not exist")
+        return value
+
+
+class FileChangeRepository:
+    """Persist and query exact file transitions after process restart."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, value: FileChange) -> FileChange:
+        self._session.add(
+            FileChangeRow(
+                id=value.id,
+                change_set_id=value.change_set_id,
+                run_id=value.run_id,
+                path=value.path,
+                provider_call_id=value.provider_call_id,
+                status=value.status.value,
+                data=value.model_dump(mode="json"),
+                created_at=value.created_at,
+                completed_at=value.completed_at,
+            )
+        )
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise StorageIntegrityError("Could not create FileChange") from error
+        return value
+
+    async def get(self, change_id: UUID) -> FileChange | None:
+        row = await self._session.get(FileChangeRow, change_id)
+        return None if row is None else FileChange.model_validate(row.data)
+
+    async def get_required(self, change_id: UUID) -> FileChange:
+        value = await self.get(change_id)
+        if value is None:
+            raise ChangeNotFoundError(str(change_id))
+        return value
+
+    async def list_for_run(self, run_id: UUID) -> list[FileChange]:
+        rows = await self._session.scalars(
+            select(FileChangeRow)
+            .where(FileChangeRow.run_id == run_id)
+            .order_by(FileChangeRow.created_at, FileChangeRow.id)
+        )
+        return [FileChange.model_validate(row.data) for row in rows]
+
+    async def save(self, value: FileChange) -> FileChange:
+        result = await self._session.execute(
+            update(FileChangeRow)
+            .where(FileChangeRow.id == value.id)
+            .values(
+                status=value.status.value,
+                data=value.model_dump(mode="json"),
+                completed_at=value.completed_at,
+            )
+            .returning(FileChangeRow.id)
+        )
+        if result.scalar_one_or_none() is None:
+            raise ChangeNotFoundError(str(value.id))
+        return value
 
 
 class ArtifactRepository:
