@@ -129,6 +129,14 @@ class ApprovalRecorder(Protocol):
 class AgentDelegationExecutor(Protocol):
     """Kernel-owned child execution boundary injected into delegation tools."""
 
+    async def preflight(
+        self,
+        request: DelegationRequest,
+        context: ToolExecutionContext,
+        *,
+        provider_call_id: str,
+    ) -> None: ...
+
     async def delegate(
         self,
         request: DelegationRequest,
@@ -191,4 +199,5 @@ class ToolDefinition[ParamsT: BaseModel]:
     params_model: type[ParamsT]
     policy: ToolPolicy
     handler: ToolHandler[ParamsT]
+    preflight: ToolApprovalPreviewer[ParamsT] | None = None
     approval_previewer: ToolApprovalPreviewer[ParamsT] | None = None

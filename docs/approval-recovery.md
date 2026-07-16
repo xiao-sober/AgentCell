@@ -59,6 +59,12 @@ Checkpoint 保存 Agent、用户、原始任务、工作区、CapabilityLease、
 
 用户请求回滚时创建新的审批和反向 FileChange：修改/补丁恢复 before Artifact，新建文件转为受审批删除，删除文件转为受审批恢复。只有当前状态仍与原 after 状态一致时才能执行；回滚后保留原记录并建立 `reverts_change_id` 关联，不删除历史。Git 仅补充 HEAD/dirty/path Diff 信息，不参与自动 reset 或全工作区恢复。
 
+### 4.3 阶段 9.3 Team 子 Run 恢复
+
+Team 中的审批属于当前阶段子 Run，但用户看到和恢复的是 root Run。CLI 因此通过 `HandoffService.decide_approval` 统一提交子审批并结算 root：子 Run 恢复成功后继续后续阶段；子 Run 在已批准工具执行后因 Provider、预算或运行时错误失败时，Handoff 会把结构化阶段、错误码和原因同步到 root，并把 root 收敛为 `failed`。恢复异常不能再让数据库长期留下 `failed child + paused root`，CLI 也不再用未归类的通用异常覆盖 Team 诊断。
+
+deferred-tool 的工具保留例外只覆盖恢复起始请求。已批准调用得到处理并产生首个新模型请求后，正常的最终回答窗口重新生效；这样既不会跳过批准操作，也不会让一次审批恢复永久解除工具预算收尾约束。`finalize_after_successful_test` 随 RunRequest、AgentDelegation 和审批 Checkpoint 持久化；重启后只有获批 `shell.test` 返回“真实执行、成功、非 collect-only”的结构化证据才会进入无工具最终回答，单纯退出码 0 或 `pytest --collect-only` 不会误触发。Handoff 在子 Run 结算时同时把完整 Usage 写入 `agent_delegations.accounted_usage`，避免 root 快照正确而委派投影仍停留在审批前。
+
 ## 5. 非幂等防重放
 
 `tool_executions` 使用 `(run_id, provider_call_id)` 唯一键：

@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 from agentcell.agents import DelegationRequest, DelegationResult
 from agentcell.errors import ToolCallDeferredError, ToolExecutionError
 from agentcell.policy import Capability, RiskLevel, ToolPolicy
-from agentcell.tools.models import ToolDefinition, ToolExecutionContext
+from agentcell.tools.models import ToolApprovalPreview, ToolDefinition, ToolExecutionContext
 from agentcell.tools.registry import ToolRegistry
 
 
@@ -47,6 +47,24 @@ async def agent_delegate(
     return AgentDelegateOutput(result=result)
 
 
+async def preflight_agent_delegate(
+    params: AgentDelegateParams,
+    context: ToolExecutionContext,
+) -> ToolApprovalPreview:
+    if context.delegation is None or context.run_id is None:
+        raise ToolExecutionError("agent.delegate")
+    provider_call_id = context.provider_call_id
+    if not isinstance(provider_call_id, str) or not provider_call_id:
+        raise ToolExecutionError("agent.delegate")
+    request = DelegationRequest.model_validate(params.model_dump())
+    await context.delegation.preflight(
+        request,
+        context,
+        provider_call_id=provider_call_id,
+    )
+    return ToolApprovalPreview(impact=f"Delegate a bounded task to {request.agent_id}")
+
+
 def register_delegation_tool(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
@@ -62,5 +80,6 @@ def register_delegation_tool(registry: ToolRegistry) -> None:
                 capabilities=frozenset({Capability.AGENT_DELEGATE}),
             ),
             handler=agent_delegate,
+            preflight=preflight_agent_delegate,
         )
     )

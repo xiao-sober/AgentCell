@@ -7,40 +7,50 @@ import json
 import os
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import typer
 import uvicorn
-from pydantic import BaseModel, ConfigDict, TypeAdapter
-from rich.console import Console
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
 
-from agentcell.agents import AgentRegistry, AgentSpec, coordinator_spec
+from agentcell.agents import (
+    AgentRegistry,
+    AgentSpec,
+    DelegationStatus,
+    HandoffResult,
+    RegisteredAgent,
+    coordinator_spec,
+)
 from agentcell.api import create_app
 from agentcell.application import AgentCellApplication, build_application
-from agentcell.changes import ChangeDetails, FileChange
-from agentcell.changes.service import ChangeService
-from agentcell.errors import AgentCellError, RunNotFoundError
-from agentcell.events import (
-    DomainEvent,
-    EventPayload,
-    EventType,
-    GenericEventPayload,
-    JsonValue,
-    TextDeltaPayload,
+from agentcell.budgets import BudgetTracker
+from agentcell.cli.approvals import prompt_approval, resume_decision
+from agentcell.cli.changes import changes_app
+from agentcell.cli.common import (
+    console,
 )
-from agentcell.kernel.event_recorder import RunEventRecorder
+from agentcell.cli.common import (
+    database as _database,
+)
+from agentcell.cli.common import (
+    raise_cli_error as _raise_cli_error,
+)
+from agentcell.cli.display import CliEventRenderer
+from agentcell.cli.profile import CliRunProfile, CliTaskProfile, CliTeamProfile, CommandProfile
+from agentcell.conversations import ConversationRoutingMode
+from agentcell.errors import AgentCellError, ConversationModelBindingError, RunNotFoundError
+from agentcell.kernel.checkpoint import CheckpointKind
 from agentcell.kernel.models import Run
 from agentcell.kernel.replay import ReplayService, ReplayState
 from agentcell.kernel.run_service import RunRequest, RunResult, RunService
 from agentcell.memory import MemoryScope, MemorySearchResult
 from agentcell.policy import (
-    Approval,
     ApprovalDecision,
     ApprovalDecisionKind,
     ApprovalStatus,
-    CapabilityLease,
+    Capability,
     PermissionMode,
 )
 from agentcell.providers import (
@@ -50,12 +60,19 @@ from agentcell.providers import (
     FakeTextStep,
     ProviderFactory,
 )
+from agentcell.routing import (
+    TASK_ROUTER_AGENT_ID,
+    TaskExecutionResult,
+    TaskRouteDecision,
+    TaskRouteRequest,
+    TaskRouteStatus,
+    deterministic_route,
+)
 from agentcell.storage import (
     ApprovalRepository,
+    CheckpointRepository,
     ConversationRepository,
-    Database,
     EventStore,
-    FileArtifactStore,
     RunRepository,
 )
 from agentcell.tools import ToolDefinition, ToolRegistry, register_workspace_tools
@@ -65,11 +82,9 @@ app = typer.Typer(
     help="Local-first Agent runtime.",
     no_args_is_help=True,
 )
-console = Console()
 agents_app = typer.Typer(help="Inspect and manage Agent declarations.")
 tools_app = typer.Typer(help="Inspect registered tools and policies.")
 memory_app = typer.Typer(help="Search scoped long-term memory.")
-changes_app = typer.Typer(help="Inspect and safely revert AgentCell file changes.")
 app.add_typer(agents_app, name="agents")
 app.add_typer(tools_app, name="tools")
 app.add_typer(memory_app, name="memory")
@@ -77,18 +92,26 @@ app.add_typer(changes_app, name="changes")
 _DEFAULT_WORKSPACE = Path.cwd()
 _DEFAULT_CONFIG = Path("agentcell.toml")
 
-PromptArgument = Annotated[str, typer.Argument(help="Task for the selected Agent.")]
+PromptArgument = Annotated[str, typer.Argument(help="Task for the selected Agent or Team.")]
 WorkspaceOption = Annotated[
     Path,
     typer.Option("--workspace", "-w", help="Workspace root constrained by the Run lease."),
 ]
 DatabaseOption = Annotated[
     str | None,
-    typer.Option("--database-url", help="Migrated SQLite aiosqlite URL."),
+    typer.Option(
+        "--database-url",
+        help="Migrated SQLite aiosqlite URL.",
+        rich_help_panel="Advanced",
+    ),
 ]
 ConfigOption = Annotated[
     Path,
-    typer.Option("--config", help="AgentCell TOML used outside offline Fake mode."),
+    typer.Option(
+        "--config",
+        help="AgentCell TOML used outside offline Fake mode.",
+        rich_help_panel="Advanced",
+    ),
 ]
 ModelOption = Annotated[
     str | None,
@@ -96,7 +119,11 @@ ModelOption = Annotated[
 ]
 OfflineOption = Annotated[
     bool,
-    typer.Option("--offline-fake", help="Use a deterministic offline Fake Provider."),
+    typer.Option(
+        "--offline-fake",
+        help="Use a deterministic offline Fake Provider.",
+        rich_help_panel="Advanced",
+    ),
 ]
 JsonOption = Annotated[
     bool,
@@ -106,13 +133,21 @@ JsonEventsOption = Annotated[
     bool,
     typer.Option("--json-events", help="Write persisted Run events as NDJSON without ANSI."),
 ]
+DryRouteOption = Annotated[
+    bool,
+    typer.Option(
+        "--dry-route",
+        help="Preview routing without creating a Run or executing tools.",
+    ),
+]
 MaxRequestsOption = Annotated[
     int | None,
     typer.Option(
         "--max-requests",
         min=1,
         max=100,
-        help="Override the Run model-request budget (default: 10).",
+        help="Override model requests (single Agent default: 10; software Team: 24).",
+        rich_help_panel="Budget",
     ),
 ]
 MaxToolCallsOption = Annotated[
@@ -121,7 +156,8 @@ MaxToolCallsOption = Annotated[
         "--max-tool-calls",
         min=1,
         max=1000,
-        help="Override the Run tool-call budget (default: 20).",
+        help="Override tool calls (single Agent default: 20; software Team: 48).",
+        rich_help_panel="Budget",
     ),
 ]
 MaxInputTokensOption = Annotated[
@@ -131,6 +167,7 @@ MaxInputTokensOption = Annotated[
         min=1,
         max=2_000_000,
         help="Override cumulative Run input-token budget (default: 200000).",
+        rich_help_panel="Budget",
     ),
 ]
 MaxTotalTokensOption = Annotated[
@@ -140,31 +177,66 @@ MaxTotalTokensOption = Annotated[
         min=1,
         max=2_000_000,
         help="Override cumulative Run total-token budget (default: 240000).",
+        rich_help_panel="Budget",
     ),
 ]
 AgentOption = Annotated[
-    str,
+    str | None,
     typer.Option("--agent", help="Built-in or registered Agent id."),
 ]
-PermissionModeOption = Annotated[
-    PermissionMode,
+TeamOption = Annotated[
+    str | None,
+    typer.Option("--team", help="Versioned deterministic Team id (for example: software)."),
+]
+ApprovalModeOption = Annotated[
+    PermissionMode | None,
     typer.Option(
-        "--permission-mode",
+        "--approval-mode",
         help="Approval policy: request, auto (guarded only), or full (leased operations).",
     ),
 ]
-AllowWriteOption = Annotated[
+LegacyPermissionModeOption = Annotated[
+    PermissionMode | None,
+    typer.Option("--permission-mode", hidden=True),
+]
+WriteScopeOption = Annotated[
     list[str] | None,
     typer.Option(
-        "--allow-write",
-        help="Workspace-relative writable path; repeat for multiple scopes.",
+        "--write-scope",
+        help="Narrow writable paths; coder defaults to the workspace root.",
+        rich_help_panel="Capabilities",
     ),
 ]
-AllowCommandOption = Annotated[
+LegacyAllowWriteOption = Annotated[
+    list[str] | None,
+    typer.Option("--allow-write", hidden=True),
+]
+CommandOption = Annotated[
     list[str] | None,
     typer.Option(
-        "--allow-command",
-        help="Executable name allowed by the Run lease; repeat as needed.",
+        "--command",
+        help="Exact executable name allowed by the Run lease; repeat as needed.",
+        rich_help_panel="Capabilities",
+    ),
+]
+LegacyAllowCommandOption = Annotated[
+    list[str] | None,
+    typer.Option("--allow-command", hidden=True),
+]
+CommandProfileOption = Annotated[
+    list[CommandProfile] | None,
+    typer.Option(
+        "--command-profile",
+        help="Named exact command profile: pytest, ruff, or pyright.",
+        rich_help_panel="Capabilities",
+    ),
+]
+NetworkDomainOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--network-domain",
+        help="Approved HTTPS domain for a network-capable Agent; repeat as needed.",
+        rich_help_panel="Capabilities",
     ),
 ]
 StreamOption = Annotated[
@@ -184,89 +256,6 @@ class RunInspection(BaseModel):
     pending_approval_ids: tuple[UUID, ...]
 
 
-class CliEventRenderer:
-    """Sequence-aware Rich renderer for public domain events only."""
-
-    def __init__(self, *, enabled: bool, json_events: bool = False) -> None:
-        self.enabled = enabled
-        self.json_events = json_events
-        self.last_sequence = 0
-        self.text_streamed = False
-        self._text_line_open = False
-
-    def render(self, event: DomainEvent[EventPayload]) -> None:
-        if event.sequence <= self.last_sequence:
-            return
-        self.last_sequence = event.sequence
-        if not self.enabled:
-            return
-        if self.json_events:
-            console.print(
-                json.dumps(
-                    {
-                        "event_id": str(event.event_id),
-                        "run_id": str(event.run_id),
-                        "sequence": event.sequence,
-                        "event_type": event.event_type.value,
-                        "occurred_at": event.occurred_at.isoformat(),
-                        "payload": event.safe_payload(),
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-                markup=False,
-                soft_wrap=True,
-            )
-            return
-        if event.event_type is EventType.MODEL_TEXT_DELTA and isinstance(
-            event.payload, TextDeltaPayload
-        ):
-            console.print(event.payload.delta, end="", markup=False, soft_wrap=True)
-            self.text_streamed = True
-            self._text_line_open = True
-            return
-        data = event.payload.data if isinstance(event.payload, GenericEventPayload) else {}
-        if event.event_type in {
-            EventType.TOOL_PROPOSED,
-            EventType.TOOL_STARTED,
-            EventType.TOOL_COMPLETED,
-            EventType.TOOL_FAILED,
-        }:
-            self._finish_text_line()
-            console.print(f"[dim]{event.event_type.value} tool={data.get('tool_name', '-')}[/dim]")
-        elif event.event_type in {
-            EventType.TOOL_APPROVAL_REQUIRED,
-            EventType.TOOL_APPROVED,
-            EventType.TOOL_REJECTED,
-        }:
-            self._finish_text_line()
-            console.print(
-                f"[yellow]{event.event_type.value}[/yellow] tool={data.get('tool_name', '-')}"
-            )
-        elif event.event_type is EventType.BUDGET_UPDATED:
-            self._finish_text_line()
-            console.print(f"[dim]budget.updated source={data.get('source', '-')}[/dim]")
-        elif event.event_type in {
-            EventType.CONTEXT_COMPACTED,
-            EventType.AGENT_CHILD_STARTED,
-            EventType.AGENT_CHILD_COMPLETED,
-            EventType.FILE_CHANGE_PREPARED,
-            EventType.FILE_CHANGE_COMPLETED,
-            EventType.FILE_CHANGE_CONFLICT,
-            EventType.FILE_CHANGE_REVERTED,
-        }:
-            self._finish_text_line()
-            console.print(f"[dim]{event.event_type.value}[/dim]")
-
-    def finish(self) -> None:
-        self._finish_text_line()
-
-    def _finish_text_line(self) -> None:
-        if self._text_line_open:
-            console.print()
-            self._text_line_open = False
-
-
 @app.callback()
 def root() -> None:
     """Select an AgentCell command."""
@@ -276,16 +265,23 @@ def root() -> None:
 def run_command(
     prompt: PromptArgument,
     workspace: WorkspaceOption = _DEFAULT_WORKSPACE,
-    agent_id: AgentOption = "coordinator",
-    permission_mode: PermissionModeOption = PermissionMode.REQUEST,
-    allow_write: AllowWriteOption = None,
-    allow_command: AllowCommandOption = None,
+    agent_id: AgentOption = None,
+    team_id: TeamOption = None,
+    approval_mode: ApprovalModeOption = None,
+    write_scope: WriteScopeOption = None,
+    command_profile: CommandProfileOption = None,
+    command: CommandOption = None,
+    network_domain: NetworkDomainOption = None,
+    permission_mode: LegacyPermissionModeOption = None,
+    allow_write: LegacyAllowWriteOption = None,
+    allow_command: LegacyAllowCommandOption = None,
     database_url: DatabaseOption = None,
     config: ConfigOption = _DEFAULT_CONFIG,
     model_ref: ModelOption = None,
     offline_fake: OfflineOption = False,
     json_output: JsonOption = False,
     json_events: JsonEventsOption = False,
+    dry_route: DryRouteOption = False,
     stream: StreamOption = True,
     max_requests: MaxRequestsOption = None,
     max_tool_calls: MaxToolCallsOption = None,
@@ -294,19 +290,68 @@ def run_command(
 ) -> None:
     """Execute one Run in-process and persist its complete event history."""
 
+    run_id = uuid4()
+    conversation_id = uuid4()
+    user_id = uuid4()
     try:
         if json_output and json_events:
             raise ValueError("--json and --json-events are mutually exclusive")
+        if dry_route and json_events:
+            raise ValueError("--dry-route and --json-events are mutually exclusive")
+        if agent_id is not None and team_id is not None:
+            raise ValueError("--agent and --team are mutually exclusive")
+        if dry_route:
+            decision = asyncio.run(
+                _preview_route_once(
+                    prompt=prompt,
+                    workspace=workspace,
+                    agent_id=agent_id,
+                    team_id=team_id,
+                    approval_mode=approval_mode,
+                    permission_mode=permission_mode,
+                    write_scope=write_scope,
+                    allow_write=allow_write,
+                    command_profile=command_profile,
+                    command=command,
+                    allow_command=allow_command,
+                    network_domain=network_domain,
+                    database_url=database_url,
+                    config=config,
+                    model_ref=model_ref,
+                    offline_fake=offline_fake,
+                    max_requests=max_requests,
+                    max_tool_calls=max_tool_calls,
+                    max_input_tokens=max_input_tokens,
+                    max_total_tokens=max_total_tokens,
+                )
+            )
+            if json_output:
+                console.print_json(decision.model_dump_json())
+            else:
+                console.print(
+                    f"route={decision.mode.value}:{decision.target_id} "
+                    f"source={decision.source.value} status={decision.status.value} "
+                    f"confidence={decision.confidence:.2f} authoritative=false"
+                )
+                console.print(decision.reason_summary)
+            return
         result, text_streamed = asyncio.run(
             _run_once(
                 prompt=prompt,
                 workspace=workspace,
                 agent_id=agent_id,
+                team_id=team_id,
+                approval_mode=approval_mode,
                 permission_mode=permission_mode,
+                write_scope=write_scope,
                 allow_write=allow_write,
+                command_profile=command_profile,
+                command=command,
                 allow_command=allow_command,
+                network_domain=network_domain,
                 stream=(stream and not json_output) or json_events,
                 json_events=json_events,
+                show_deprecations=not json_output and not json_events,
                 database_url=database_url,
                 config=config,
                 model_ref=model_ref,
@@ -315,21 +360,128 @@ def run_command(
                 max_tool_calls=max_tool_calls,
                 max_input_tokens=max_input_tokens,
                 max_total_tokens=max_total_tokens,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
             )
         )
     except KeyboardInterrupt as error:
-        console.print("[yellow]Run cancelled.[/yellow]")
+        machine_output = json_output or json_events
+        if not machine_output:
+            console.print("[yellow]Run cancelled.[/yellow]")
+        _print_run_failure(
+            run_id=run_id,
+            conversation_id=conversation_id,
+            status="cancelled",
+            error_code="run_cancelled",
+            json_output=machine_output,
+        )
         raise typer.Exit(code=130) from error
     except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
-        console.print(f"[red]Run failed:[/red] {error}")
-        if isinstance(error, SQLAlchemyError):
-            console.print("[dim]Apply migrations first: uv run alembic upgrade head[/dim]")
+        machine_output = json_output or json_events
+        if not machine_output:
+            console.print(f"[red]Run failed:[/red] {error}")
+            if isinstance(error, SQLAlchemyError):
+                console.print("[dim]Apply migrations first: uv run alembic upgrade head[/dim]")
+        _print_run_failure(
+            run_id=run_id,
+            conversation_id=conversation_id,
+            status=_persisted_status(run_id, database_url) or "failed",
+            error_code=_cli_error_code(error),
+            json_output=machine_output,
+        )
         raise typer.Exit(code=1) from error
 
     if json_output:
         console.print_json(result.model_dump_json())
+        if (
+            isinstance(result, HandoffResult)
+            and result.status is DelegationStatus.FAILED
+            or isinstance(result, TaskExecutionResult)
+            and result.run.status.value == "failed"
+        ):
+            raise typer.Exit(code=1)
         return
     if json_events:
+        if (
+            isinstance(result, HandoffResult)
+            and result.status is DelegationStatus.FAILED
+            or isinstance(result, TaskExecutionResult)
+            and result.run.status.value == "failed"
+        ):
+            raise typer.Exit(code=1)
+        return
+    if isinstance(result, TaskExecutionResult):
+        if result.output is not None and not text_streamed:
+            console.print(result.output)
+        for approval in result.approvals:
+            console.print(
+                f"[yellow]approval required[/yellow] id={approval.id} "
+                f"child_run_id={approval.run_id} tool={approval.tool_name}"
+            )
+            console.print(
+                f"[dim]Resume with: uv run agentcell resume {result.run.id} "
+                f"--approval-id {approval.id} --decision approve[/dim]"
+            )
+        usage = result.budget.used
+        child_ids = ",".join(str(item) for item in result.child_run_ids)
+        target = result.decision.target_id
+        console.print(
+            f"[dim]root_run_id={result.run.id} child_run_ids={child_ids} "
+            f"conversation_id={result.run.conversation_id} "
+            f"route={result.decision.mode.value}:{target} "
+            f"source={result.decision.source.value} confidence={result.decision.confidence:.2f} "
+            f"status={result.run.status.value} requests={usage.requests} "
+            f"tool_calls={usage.tool_calls} tokens={usage.total_tokens}[/dim]"
+        )
+        cache_hit_ratio = (
+            0.0
+            if usage.input_tokens == 0
+            else min(1.0, usage.cache_read_tokens / usage.input_tokens)
+        )
+        console.print(
+            f"[dim]tokens input={usage.input_tokens} output={usage.output_tokens} "
+            f"total={usage.total_tokens} cache_read={usage.cache_read_tokens} "
+            f"cache_write={usage.cache_write_tokens} cache_hit={cache_hit_ratio:.1%}[/dim]"
+        )
+        if result.decision.capability_gaps:
+            gaps = ", ".join(item.value for item in result.decision.capability_gaps)
+            console.print(f"[yellow]Route confirmation required:[/yellow] missing {gaps}")
+        for issue in result.decision.issues:
+            console.print(f"[yellow]route issue[/yellow] code={issue.code.value} {issue.message}")
+        if result.run.status.value == "failed":
+            raise typer.Exit(code=1)
+        return
+    if isinstance(result, HandoffResult):
+        if result.output is not None and not text_streamed:
+            console.print(result.output)
+        for stage in result.stages:
+            for approval_id in stage.approval_ids:
+                console.print(
+                    f"[yellow]approval required[/yellow] id={approval_id} "
+                    f"child_run_id={stage.child_run_id} stage={stage.agent_id}"
+                )
+                console.print(
+                    f"[dim]Resume with: uv run agentcell resume {result.root_run_id} "
+                    f"--approval-id {approval_id} --decision approve[/dim]"
+                )
+        usage = result.budget.used
+        child_ids = ",".join(str(stage.child_run_id) for stage in result.stages)
+        console.print(
+            f"[dim]root_run_id={result.root_run_id} child_run_ids={child_ids} "
+            f"conversation_id={result.conversation_id} "
+            f"team={result.team_id}@v{result.team_version} "
+            f"status={result.status.value} requests={usage.requests} "
+            f"tool_calls={usage.tool_calls} tokens={usage.total_tokens}[/dim]"
+        )
+        if result.status is DelegationStatus.FAILED:
+            stage = result.error_stage.value if result.error_stage is not None else "unknown"
+            console.print(
+                f"[red]Team failed:[/red] stage={stage} "
+                f"code={result.error_code or 'handoff_failed'} "
+                f"message={result.error_message or 'Team execution failed'}"
+            )
+            raise typer.Exit(code=1)
         return
     if result.output is not None and not text_streamed:
         console.print(result.output)
@@ -370,9 +522,15 @@ def chat_command(
         str | None,
         typer.Option("--agent", help="Agent for a new Conversation; must match when continuing."),
     ] = None,
-    permission_mode: PermissionModeOption = PermissionMode.REQUEST,
-    allow_write: AllowWriteOption = None,
-    allow_command: AllowCommandOption = None,
+    team_id: TeamOption = None,
+    approval_mode: ApprovalModeOption = None,
+    write_scope: WriteScopeOption = None,
+    command_profile: CommandProfileOption = None,
+    command: CommandOption = None,
+    network_domain: NetworkDomainOption = None,
+    permission_mode: LegacyPermissionModeOption = None,
+    allow_write: LegacyAllowWriteOption = None,
+    allow_command: LegacyAllowCommandOption = None,
     database_url: DatabaseOption = None,
     config: ConfigOption = _DEFAULT_CONFIG,
     model_ref: ModelOption = None,
@@ -392,9 +550,15 @@ def chat_command(
                 conversation_id=conversation_id,
                 user_id=user_id,
                 agent_id=agent_id,
+                team_id=team_id,
+                approval_mode=approval_mode,
                 permission_mode=permission_mode,
+                write_scope=write_scope,
                 allow_write=allow_write,
+                command_profile=command_profile,
+                command=command,
                 allow_command=allow_command,
+                network_domain=network_domain,
                 stream=stream,
                 database_url=database_url,
                 config=config,
@@ -509,9 +673,17 @@ def resume_command(
         typer.Option("--approval-id", help="Pending approval to decide before resuming."),
     ] = None,
     decision: Annotated[
-        ApprovalDecisionKind,
-        typer.Option("--decision", help="Approval decision."),
-    ] = ApprovalDecisionKind.APPROVE,
+        ApprovalDecisionKind | None,
+        typer.Option("--decision", help="Explicit approval decision."),
+    ] = None,
+    arguments_json: Annotated[
+        str | None,
+        typer.Option("--arguments-json", help="Replacement arguments for --decision modify."),
+    ] = None,
+    grant_same_tool: Annotated[
+        bool,
+        typer.Option("--grant-same-tool", help="Approve this tool for the remainder of the Run."),
+    ] = False,
     database_url: DatabaseOption = None,
     config: ConfigOption = _DEFAULT_CONFIG,
     offline_fake: OfflineOption = False,
@@ -520,11 +692,17 @@ def resume_command(
     """Resume a delegated Run or decide a pending approval in-process."""
 
     try:
-        run = asyncio.run(
+        approval_decision = resume_decision(
+            approval_id=approval_id,
+            decision=decision,
+            arguments_json=arguments_json,
+            grant_same_tool=grant_same_tool,
+        )
+        resumed = asyncio.run(
             _resume_once(
                 run_id,
                 approval_id=approval_id,
-                decision=decision,
+                decision=approval_decision,
                 database_url=database_url,
                 config=config,
                 offline_fake=offline_fake,
@@ -533,9 +711,41 @@ def resume_command(
     except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
         _raise_cli_error(error)
     if json_output:
-        console.print_json(run.model_dump_json())
+        console.print_json(resumed.model_dump_json())
+        if (
+            isinstance(resumed, HandoffResult)
+            and resumed.status is DelegationStatus.FAILED
+            or isinstance(resumed, TaskExecutionResult)
+            and resumed.run.status.value == "failed"
+        ):
+            raise typer.Exit(code=1)
+    elif isinstance(resumed, TaskExecutionResult):
+        child_ids = ",".join(str(item) for item in resumed.child_run_ids)
+        console.print(
+            f"root_run_id={resumed.run.id} child_run_ids={child_ids} "
+            f"route={resumed.decision.mode.value}:{resumed.decision.target_id} "
+            f"status={resumed.run.status.value}"
+        )
+        if resumed.output:
+            console.print(resumed.output)
+        if resumed.run.status.value == "failed":
+            raise typer.Exit(code=1)
+    elif isinstance(resumed, HandoffResult):
+        child_ids = ",".join(str(item.child_run_id) for item in resumed.stages)
+        console.print(
+            f"root_run_id={resumed.root_run_id} child_run_ids={child_ids} "
+            f"status={resumed.status.value}"
+        )
+        if resumed.status is DelegationStatus.FAILED:
+            stage = resumed.error_stage.value if resumed.error_stage is not None else "unknown"
+            console.print(
+                f"[red]Team failed:[/red] stage={stage} "
+                f"code={resumed.error_code or 'handoff_failed'} "
+                f"message={resumed.error_message or 'Team execution failed'}"
+            )
+            raise typer.Exit(code=1)
     else:
-        console.print(f"run_id={run.id} status={run.status.value}")
+        console.print(f"run_id={resumed.id} status={resumed.status.value}")
 
 
 @agents_app.command("list")
@@ -543,19 +753,62 @@ def agents_list_command(
     database_url: DatabaseOption = None,
     config: ConfigOption = _DEFAULT_CONFIG,
     offline_fake: OfflineOption = False,
+    all_agents: Annotated[
+        bool,
+        typer.Option("--all", help="Include internal runtime roles."),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Show full Agent limits and declarations."),
+    ] = False,
     json_output: JsonOption = False,
 ) -> None:
     """List built-in and persisted Agent declarations."""
 
     try:
-        specs = asyncio.run(_list_agents(database_url, config, offline_fake))
+        entries = asyncio.run(
+            _list_agents(
+                database_url,
+                config,
+                offline_fake,
+                include_internal=all_agents or json_output,
+            )
+        )
     except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
         _raise_cli_error(error)
     if json_output:
-        console.print_json(json.dumps([item.model_dump(mode="json") for item in specs]))
+        values: list[dict[str, object]] = []
+        for entry in entries:
+            value = entry.spec.model_dump(mode="json")
+            value.update(
+                {
+                    "source": entry.source.value,
+                    "visibility": entry.visibility.value,
+                    "status": entry.status,
+                    "configured_model_ref": entry.spec.model_ref,
+                    "access": _agent_access(entry.spec),
+                }
+            )
+            values.append(value)
+        console.print_json(json.dumps(values))
     else:
-        for spec in specs:
-            console.print(f"{spec.id}\t{spec.model_ref}\t{spec.name}")
+        for entry in entries:
+            spec = entry.spec
+            console.print(
+                f"{spec.id}\t{entry.source.value}\tconfigured={spec.model_ref}\t"
+                f"access={_agent_access(spec)}\t{entry.status}"
+            )
+            if verbose:
+                console.print(
+                    f"  name={spec.name} visibility={entry.visibility.value} "
+                    f"max_steps={spec.max_steps} max_children={spec.max_children} "
+                    f"max_depth={spec.max_depth}"
+                )
+                console.print(f"  tools={','.join(spec.tools) or '-'}")
+                console.print(
+                    "  capabilities="
+                    + (",".join(sorted(item.value for item in spec.capabilities)) or "-")
+                )
 
 
 @tools_app.command("list")
@@ -625,80 +878,6 @@ def memory_search_command(
             console.print(f"{item.score:.3f}\t{item.item.id}\t{item.item.content}")
 
 
-@changes_app.command("list")
-def changes_list_command(
-    run_id: Annotated[UUID, typer.Option("--run", help="Run whose changes are listed.")],
-    database_url: DatabaseOption = None,
-    json_output: JsonOption = False,
-) -> None:
-    """List durable FileChange records for one Run."""
-
-    try:
-        values = asyncio.run(_list_changes(run_id, database_url))
-    except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
-        _raise_cli_error(error)
-    if json_output:
-        console.print_json(json.dumps([item.model_dump(mode="json") for item in values]))
-        return
-    for item in values:
-        console.print(f"{item.id} {item.status.value:10} {item.operation.value:9} {item.path}")
-
-
-@changes_app.command("show")
-def changes_show_command(
-    change_id: Annotated[UUID, typer.Argument(help="FileChange to inspect.")],
-    database_url: DatabaseOption = None,
-    json_output: JsonOption = False,
-) -> None:
-    """Show one durable FileChange and its ChangeSet metadata."""
-
-    try:
-        details = asyncio.run(_change_details(change_id, database_url))
-    except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
-        _raise_cli_error(error)
-    if json_output:
-        console.print_json(details.model_dump_json())
-        return
-    console.print(
-        f"change_id={details.change.id} run_id={details.change.run_id} "
-        f"status={details.change.status.value} path={details.change.path}"
-    )
-    console.print(details.diff)
-
-
-@changes_app.command("diff")
-def changes_diff_command(
-    change_id: Annotated[UUID, typer.Argument(help="FileChange whose full Diff is printed.")],
-    database_url: DatabaseOption = None,
-) -> None:
-    """Print the verified full Diff Artifact for one change."""
-
-    try:
-        details = asyncio.run(_change_details(change_id, database_url))
-    except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
-        _raise_cli_error(error)
-    console.print(details.diff, markup=False)
-
-
-@changes_app.command("revert")
-def changes_revert_command(
-    change_id: Annotated[UUID, typer.Argument(help="Completed FileChange to reverse.")],
-    yes: Annotated[bool, typer.Option("--yes", help="Confirm the displayed reverse Diff.")] = False,
-    database_url: DatabaseOption = None,
-) -> None:
-    """Apply one hash-safe reverse change without invoking destructive Git commands."""
-
-    try:
-        reverse_diff = asyncio.run(_change_reverse_diff(change_id, database_url))
-        console.print(reverse_diff, markup=False)
-        if not yes and not typer.confirm("Apply the reverse change shown above?"):
-            raise typer.Abort()
-        value = asyncio.run(_revert_change(change_id, database_url))
-    except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
-        _raise_cli_error(error)
-    console.print(f"reverted change_id={change_id} reverse_change_id={value.id} path={value.path}")
-
-
 @app.command("serve")
 def serve_command(
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
@@ -717,16 +896,20 @@ def serve_command(
     uvicorn.run(create_app(), host=host, port=port)
 
 
-async def _run_once(
+async def _preview_route_once(
     *,
     prompt: str,
     workspace: Path,
-    agent_id: str,
-    permission_mode: PermissionMode,
+    agent_id: str | None,
+    team_id: str | None,
+    approval_mode: PermissionMode | None,
+    permission_mode: PermissionMode | None,
+    write_scope: list[str] | None,
     allow_write: list[str] | None,
+    command_profile: list[CommandProfile] | None,
+    command: list[str] | None,
     allow_command: list[str] | None,
-    stream: bool,
-    json_events: bool,
+    network_domain: list[str] | None,
     database_url: str | None,
     config: Path,
     model_ref: str | None,
@@ -735,21 +918,262 @@ async def _run_once(
     max_tool_calls: int | None,
     max_input_tokens: int | None,
     max_total_tokens: int | None,
-) -> tuple[RunResult, bool]:
+) -> TaskRouteDecision:
     application = await build_application(
         config=config,
         database_url=database_url,
         offline_fake=offline_fake,
-        fake_output=f"Offline result: {prompt}",
         model_ref=model_ref,
     )
     try:
+        profile = CliTaskProfile.resolve(
+            application.teams.get("software"),
+            approval_mode=approval_mode,
+            permission_mode=permission_mode,
+            write_scopes=write_scope,
+            legacy_write_scopes=allow_write,
+            commands=command,
+            legacy_commands=allow_command,
+            command_profiles=command_profile,
+            network_domains=network_domain,
+            max_requests=max_requests,
+            max_tool_calls=max_tool_calls,
+            max_input_tokens=max_input_tokens,
+            max_total_tokens=max_total_tokens,
+        )
+        return await application.routing.preview(
+            TaskRouteRequest(
+                task=prompt,
+                workspace=workspace,
+                lease=profile.lease,
+                permission_mode=profile.approval_mode,
+                budget=profile.budget,
+                model_ref=model_ref,
+                agent_id=agent_id,
+                team_id=team_id,
+            )
+        )
+    finally:
+        await application.close()
+
+
+async def _execute_cli_route(
+    application: AgentCellApplication,
+    request: TaskRouteRequest,
+    *,
+    stream: bool,
+    json_events: bool,
+) -> tuple[TaskExecutionResult, bool]:
+    renderer = CliEventRenderer(
+        enabled=stream,
+        json_events=json_events,
+        output=console,
+    )
+    prepared = await _await_with_events(
+        application.routing.prepare(request),
+        application=application,
+        run_id=request.root_run_id,
+        renderer=renderer,
+    )
+    if (
+        prepared.decision.status is TaskRouteStatus.CONFIRMATION_REQUIRED
+        and not prepared.decision.capability_gaps
+        and console.is_terminal
+        and typer.confirm(
+            f"Use {prepared.decision.mode.value} {prepared.decision.target_id!r}?",
+            default=False,
+        )
+    ):
+        prepared = await _await_with_events(
+            application.routing.confirm(
+                request.root_run_id,
+                decision_hash=str(prepared.decision.decision_hash),
+            ),
+            application=application,
+            run_id=request.root_run_id,
+            renderer=renderer,
+        )
+    if prepared.decision.status is not TaskRouteStatus.READY:
+        renderer.finish()
+        return TaskExecutionResult(
+            run=prepared.root,
+            decision=prepared.decision,
+            budget=BudgetTracker(
+                request.budget,
+                initial_usage=prepared.decision.routing_usage,
+            ).snapshot(),
+        ), renderer.text_streamed
+    result = await _await_with_events(
+        application.routing.execute(prepared),
+        application=application,
+        run_id=request.root_run_id,
+        renderer=renderer,
+    )
+    while not result.run.status.is_terminal and result.approvals and console.is_terminal:
+        decision = prompt_approval(
+            result.approvals[0],
+            output=console,
+            renderer=renderer,
+        )
+        if decision is None:
+            break
+        result = await _await_with_events(
+            application.routing.decide_approval(
+                result.run.id,
+                result.approvals[0].id,
+                decision,
+            ),
+            application=application,
+            run_id=result.run.id,
+            renderer=renderer,
+        )
+    renderer.finish()
+    return result, renderer.text_streamed
+
+
+async def _run_once(
+    *,
+    prompt: str,
+    workspace: Path,
+    agent_id: str | None,
+    team_id: str | None,
+    approval_mode: PermissionMode | None,
+    permission_mode: PermissionMode | None,
+    write_scope: list[str] | None,
+    allow_write: list[str] | None,
+    command_profile: list[CommandProfile] | None,
+    command: list[str] | None,
+    allow_command: list[str] | None,
+    network_domain: list[str] | None,
+    stream: bool,
+    json_events: bool,
+    show_deprecations: bool,
+    database_url: str | None,
+    config: Path,
+    model_ref: str | None,
+    offline_fake: bool,
+    max_requests: int | None,
+    max_tool_calls: int | None,
+    max_input_tokens: int | None,
+    max_total_tokens: int | None,
+    run_id: UUID,
+    conversation_id: UUID,
+    user_id: UUID,
+) -> tuple[RunResult | HandoffResult | TaskExecutionResult, bool]:
+    application = await build_application(
+        config=config,
+        database_url=database_url,
+        offline_fake=offline_fake,
+        fake_output=(
+            f"PASS\nOffline result: {prompt}"
+            if team_id is not None
+            or (agent_id is None and deterministic_route(prompt).target_id == "software")
+            else f"Offline result: {prompt}"
+        ),
+        model_ref=model_ref,
+    )
+    try:
+        if agent_id is None and team_id is None:
+            profile = CliTaskProfile.resolve(
+                application.teams.get("software"),
+                approval_mode=approval_mode,
+                permission_mode=permission_mode,
+                write_scopes=write_scope,
+                legacy_write_scopes=allow_write,
+                commands=command,
+                legacy_commands=allow_command,
+                command_profiles=command_profile,
+                network_domains=network_domain,
+                max_requests=max_requests,
+                max_tool_calls=max_tool_calls,
+                max_input_tokens=max_input_tokens,
+                max_total_tokens=max_total_tokens,
+            )
+            if show_deprecations:
+                for message in profile.deprecation_messages():
+                    console.print(f"[yellow]Deprecated:[/yellow] {message}")
+            route_request = TaskRouteRequest(
+                task=prompt,
+                workspace=workspace,
+                lease=profile.lease,
+                permission_mode=profile.approval_mode,
+                budget=profile.budget,
+                model_ref=model_ref,
+                root_run_id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+            return await _execute_cli_route(
+                application,
+                route_request,
+                stream=stream,
+                json_events=json_events,
+            )
+
+        if team_id is not None:
+            team = application.teams.get(team_id)
+            team_profile = CliTeamProfile.resolve(
+                team,
+                application.agents,
+                approval_mode=approval_mode,
+                permission_mode=permission_mode,
+                write_scopes=write_scope,
+                legacy_write_scopes=allow_write,
+                commands=command,
+                legacy_commands=allow_command,
+                command_profiles=command_profile,
+                network_domains=network_domain,
+                max_requests=max_requests,
+                max_tool_calls=max_tool_calls,
+                max_input_tokens=max_input_tokens,
+                max_total_tokens=max_total_tokens,
+            )
+            if show_deprecations:
+                for message in team_profile.deprecation_messages():
+                    console.print(f"[yellow]Deprecated:[/yellow] {message}")
+            route_request = TaskRouteRequest(
+                task=prompt,
+                workspace=workspace,
+                root_run_id=run_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                team_id=team_id,
+                model_ref=model_ref,
+                permission_mode=team_profile.approval_mode,
+                lease=team_profile.lease,
+                budget=team_profile.budget,
+            )
+            return await _execute_cli_route(
+                application,
+                route_request,
+                stream=stream,
+                json_events=json_events,
+            )
+
+        selected_agent_id = agent_id or "coordinator"
+        profile = CliRunProfile.resolve(
+            application.agents.get(selected_agent_id),
+            approval_mode=approval_mode,
+            permission_mode=permission_mode,
+            write_scopes=write_scope,
+            legacy_write_scopes=allow_write,
+            commands=command,
+            legacy_commands=allow_command,
+            command_profiles=command_profile,
+            network_domains=network_domain,
+        )
+        if show_deprecations:
+            for message in profile.deprecation_messages():
+                console.print(f"[yellow]Deprecated:[/yellow] {message}")
         request = RunRequest(
             prompt=prompt,
             workspace=workspace,
-            agent_id=agent_id,
-            lease=_build_cli_lease(agent_id, allow_write, allow_command),
-            permission_mode=permission_mode,
+            agent_id=selected_agent_id,
+            lease=profile.lease,
+            permission_mode=profile.approval_mode,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
         )
         overrides = {
             key: value
@@ -765,25 +1189,26 @@ async def _run_once(
             request = request.model_copy(
                 update={"budget": request.budget.model_copy(update=overrides)}
             )
-        renderer = CliEventRenderer(enabled=stream, json_events=json_events)
-        result = await _await_with_events(
-            application.runs.run(request),
-            application=application,
-            run_id=request.run_id,
-            renderer=renderer,
+        request = request.model_copy(
+            update={"budget": request.budget.model_copy(update={"max_children": 1, "max_depth": 1})}
         )
-        while not result.run.status.is_terminal and result.approvals and console.is_terminal:
-            decision = _prompt_approval(result.approvals[0])
-            if decision is None:
-                break
-            result = await _await_with_events(
-                application.runs.resume(result.approvals[0].id, decision),
-                application=application,
-                run_id=result.run.id,
-                renderer=renderer,
-            )
-        renderer.finish()
-        return result, renderer.text_streamed
+        return await _execute_cli_route(
+            application,
+            TaskRouteRequest(
+                task=prompt,
+                workspace=workspace,
+                root_run_id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                agent_id=selected_agent_id,
+                model_ref=model_ref,
+                lease=profile.lease,
+                permission_mode=profile.approval_mode,
+                budget=request.budget,
+            ),
+            stream=stream,
+            json_events=json_events,
+        )
     finally:
         await application.close()
 
@@ -794,9 +1219,15 @@ async def _chat(
     conversation_id: UUID | None,
     user_id: UUID | None,
     agent_id: str | None,
-    permission_mode: PermissionMode,
+    team_id: str | None,
+    approval_mode: PermissionMode | None,
+    permission_mode: PermissionMode | None,
+    write_scope: list[str] | None,
     allow_write: list[str] | None,
+    command_profile: list[CommandProfile] | None,
+    command: list[str] | None,
     allow_command: list[str] | None,
+    network_domain: list[str] | None,
     stream: bool,
     database_url: str | None,
     config: Path,
@@ -815,11 +1246,20 @@ async def _chat(
         model_ref=model_ref,
     )
     try:
+        if agent_id is not None and team_id is not None:
+            raise ValueError("--agent and --team are mutually exclusive")
         if conversation_id is None:
             conversation = await application.conversations.create(
                 user_id=user_id or uuid4(),
                 workspace=workspace,
                 agent_id=agent_id or "coordinator",
+                routing_mode=(
+                    ConversationRoutingMode.AUTO
+                    if agent_id is None and team_id is None
+                    else ConversationRoutingMode.FIXED
+                ),
+                team_id=team_id,
+                model_ref=model_ref,
             )
         else:
             conversation = await application.conversations.get(
@@ -827,12 +1267,69 @@ async def _chat(
                 user_id=user_id,
             )
             if agent_id is not None and agent_id != conversation.agent_id:
-                raise ValueError(
-                    f"Conversation agent is {conversation.agent_id!r}; cannot continue as "
-                    f"{agent_id!r}"
+                if conversation.routing_mode is ConversationRoutingMode.FIXED:
+                    raise ValueError(
+                        f"Conversation agent is {conversation.agent_id!r}; cannot continue as "
+                        f"{agent_id!r}"
+                    )
+            if team_id is not None and conversation.routing_mode is ConversationRoutingMode.FIXED:
+                if team_id != conversation.team_id:
+                    raise ValueError(
+                        f"Conversation team is {conversation.team_id!r}; cannot continue as "
+                        f"{team_id!r}"
+                    )
+            if conversation.model_ref is None and model_ref is None:
+                raise ConversationModelBindingError(
+                    "Legacy Conversation has no recoverable model binding; "
+                    "continue once with --model-ref"
                 )
+            if (
+                conversation.model_ref is not None
+                and model_ref is not None
+                and model_ref != conversation.model_ref
+            ):
+                raise ConversationModelBindingError(
+                    f"Conversation model is {conversation.model_ref!r}; cannot continue as "
+                    f"{model_ref!r}"
+                )
+        routed = (
+            conversation.routing_mode is ConversationRoutingMode.AUTO
+            or conversation.team_id is not None
+        )
+        if routed:
+            profile = CliTaskProfile.resolve(
+                application.teams.get(conversation.team_id or "software"),
+                approval_mode=approval_mode,
+                permission_mode=permission_mode,
+                write_scopes=write_scope,
+                legacy_write_scopes=allow_write,
+                commands=command,
+                legacy_commands=allow_command,
+                command_profiles=command_profile,
+                network_domains=network_domain,
+                max_requests=max_requests,
+                max_tool_calls=max_tool_calls,
+                max_input_tokens=max_input_tokens,
+                max_total_tokens=max_total_tokens,
+            )
+        else:
+            profile = CliRunProfile.resolve(
+                application.agents.get(conversation.agent_id),
+                approval_mode=approval_mode,
+                permission_mode=permission_mode,
+                write_scopes=write_scope,
+                legacy_write_scopes=allow_write,
+                commands=command,
+                legacy_commands=allow_command,
+                command_profiles=command_profile,
+                network_domains=network_domain,
+            )
+        for message in profile.deprecation_messages():
+            console.print(f"[yellow]Deprecated:[/yellow] {message}")
         console.print(
-            f"[dim]conversation_id={conversation.id} user_id={conversation.user_id}[/dim]"
+            f"[dim]conversation_id={conversation.id} user_id={conversation.user_id} "
+            f"routing={conversation.routing_mode.value} "
+            f"model_ref={conversation.model_ref or model_ref}[/dim]"
         )
         console.print("[dim]Enter /exit to finish.[/dim]")
         while True:
@@ -844,42 +1341,156 @@ async def _chat(
                 continue
             if prompt.casefold() in {"/exit", "/quit"}:
                 break
-            base = RunRequest(prompt=prompt, workspace=Path(conversation.workspace))
-            overrides = {
-                key: value
-                for key, value in {
-                    "max_requests": max_requests,
-                    "max_tool_calls": max_tool_calls,
-                    "max_input_tokens": max_input_tokens,
-                    "max_total_tokens": max_total_tokens,
-                }.items()
-                if value is not None
-            }
-            budget = base.budget.model_copy(update=overrides) if overrides else base.budget
+            if isinstance(profile, CliTaskProfile):
+                budget = profile.budget
+            else:
+                base = RunRequest(prompt=prompt, workspace=Path(conversation.workspace))
+                overrides = {
+                    key: value
+                    for key, value in {
+                        "max_requests": max_requests,
+                        "max_tool_calls": max_tool_calls,
+                        "max_input_tokens": max_input_tokens,
+                        "max_total_tokens": max_total_tokens,
+                    }.items()
+                    if value is not None
+                }
+                budget = base.budget.model_copy(update=overrides) if overrides else base.budget
             turn_run_id = uuid4()
-            renderer = CliEventRenderer(enabled=stream)
-            result = await _await_with_events(
-                application.conversations.run_turn(
-                    conversation.id,
-                    prompt=prompt,
-                    user_id=conversation.user_id,
-                    lease=_build_cli_lease(
-                        conversation.agent_id,
-                        allow_write,
-                        allow_command,
-                    ),
-                    permission_mode=permission_mode,
-                    budget=budget,
-                    run_id=turn_run_id,
-                ),
-                application=application,
-                run_id=turn_run_id,
-                renderer=renderer,
+            renderer = CliEventRenderer(enabled=stream, output=console)
+            direct_turn = application.conversations.should_use_direct_turn(
+                conversation,
+                prompt=prompt,
+                agent_id=agent_id,
+                team_id=team_id,
             )
+            turn_uses_router = routed and not direct_turn
+            try:
+                if direct_turn:
+                    prepared_direct = await _await_with_events(
+                        application.conversations.prepare_direct_turn(
+                            conversation.id,
+                            prompt=prompt,
+                            user_id=conversation.user_id,
+                            permission_mode=profile.approval_mode,
+                            budget=budget,
+                            model_ref=model_ref,
+                            run_id=turn_run_id,
+                        ),
+                        application=application,
+                        run_id=turn_run_id,
+                        renderer=renderer,
+                    )
+                    result = await _await_with_events(
+                        application.conversations.execute_prepared(prepared_direct),
+                        application=application,
+                        run_id=turn_run_id,
+                        renderer=renderer,
+                    )
+                elif routed:
+                    prepared = await _await_with_events(
+                        application.conversations.prepare_routed_turn(
+                            conversation.id,
+                            prompt=prompt,
+                            user_id=conversation.user_id,
+                            lease=profile.lease,
+                            permission_mode=profile.approval_mode,
+                            budget=budget,
+                            model_ref=model_ref,
+                            agent_id=agent_id,
+                            team_id=team_id,
+                            run_id=turn_run_id,
+                        ),
+                        application=application,
+                        run_id=turn_run_id,
+                        renderer=renderer,
+                    )
+                    if prepared.decision.status is TaskRouteStatus.CONFIRMATION_REQUIRED:
+                        confirmed = not prepared.decision.capability_gaps and typer.confirm(
+                            f"Use {prepared.decision.mode.value} {prepared.decision.target_id!r}?",
+                            default=False,
+                        )
+                        if confirmed:
+                            prepared = await _await_with_events(
+                                application.routing.confirm(
+                                    prepared.root.id,
+                                    decision_hash=str(prepared.decision.decision_hash),
+                                ),
+                                application=application,
+                                run_id=turn_run_id,
+                                renderer=renderer,
+                            )
+                        else:
+                            if prepared.decision.capability_gaps:
+                                gaps = ", ".join(
+                                    item.value for item in prepared.decision.capability_gaps
+                                )
+                                console.print(
+                                    f"[yellow]Route rejected: explicit lease required for "
+                                    f"{gaps}.[/yellow]"
+                                )
+                            rejected = await _await_with_events(
+                                application.routing.reject(
+                                    prepared.root.id,
+                                    decision_hash=str(prepared.decision.decision_hash),
+                                ),
+                                application=application,
+                                run_id=turn_run_id,
+                                renderer=renderer,
+                            )
+                            await application.conversations.record_task_result(
+                                TaskExecutionResult(
+                                    run=rejected,
+                                    decision=prepared.decision,
+                                    budget=BudgetTracker(budget).snapshot(),
+                                )
+                            )
+                            renderer.finish()
+                            continue
+                    result = await _await_with_events(
+                        application.conversations.execute_routed_prepared(prepared),
+                        application=application,
+                        run_id=turn_run_id,
+                        renderer=renderer,
+                    )
+                else:
+                    result = await _await_with_events(
+                        application.conversations.run_turn(
+                            conversation.id,
+                            prompt=prompt,
+                            user_id=conversation.user_id,
+                            lease=profile.lease,
+                            permission_mode=profile.approval_mode,
+                            budget=budget,
+                            model_ref=model_ref,
+                            run_id=turn_run_id,
+                        ),
+                        application=application,
+                        run_id=turn_run_id,
+                        renderer=renderer,
+                    )
+            except (AgentCellError, OSError, SQLAlchemyError, ValueError) as error:
+                renderer.finish()
+                try:
+                    persisted = await application.get_run(turn_run_id)
+                except (AgentCellError, OSError, SQLAlchemyError, ValueError):
+                    persisted = None
+                _print_run_failure(
+                    run_id=turn_run_id,
+                    conversation_id=conversation.id,
+                    status="failed" if persisted is None else persisted.status.value,
+                    error_code=_cli_error_code(error),
+                    json_output=False,
+                )
+                raise
             while not result.run.status.is_terminal:
                 if result.approvals:
                     approval = result.approvals[0]
-                    approval_decision = _prompt_approval(approval)
+                    approval_decision = prompt_approval(
+                        approval,
+                        output=console,
+                        renderer=renderer,
+                    )
                     if approval_decision is None:
                         console.print(
                             f"[dim]Resume pending Run with: uv run agentcell resume "
@@ -888,23 +1499,46 @@ async def _chat(
                         console.print("[dim]Continue with:[/dim]")
                         console.print(f"uv run agentcell chat --conversation-id {conversation.id}")
                         return
-                    result = await _await_with_events(
-                        application.runs.resume(
-                            approval.id,
-                            approval_decision,
-                        ),
-                        application=application,
-                        run_id=result.run.id,
-                        renderer=renderer,
-                    )
+                    if turn_uses_router:
+                        result = await _await_with_events(
+                            application.routing.decide_approval(
+                                result.run.id,
+                                approval.id,
+                                approval_decision,
+                            ),
+                            application=application,
+                            run_id=result.run.id,
+                            renderer=renderer,
+                        )
+                        await application.conversations.record_task_result(result)
+                    else:
+                        result = await _await_with_events(
+                            application.runs.resume(
+                                approval.id,
+                                approval_decision,
+                            ),
+                            application=application,
+                            run_id=result.run.id,
+                            renderer=renderer,
+                        )
                 else:
-                    result = await _await_with_events(
-                        application.runs.resume_paused(result.run.id),
-                        application=application,
-                        run_id=result.run.id,
-                        renderer=renderer,
-                    )
-                await application.conversations.record_if_managed(result)
+                    if turn_uses_router:
+                        result = await _await_with_events(
+                            application.routing.resume(result.run.id),
+                            application=application,
+                            run_id=result.run.id,
+                            renderer=renderer,
+                        )
+                        await application.conversations.record_task_result(result)
+                    else:
+                        result = await _await_with_events(
+                            application.runs.resume_paused(result.run.id),
+                            application=application,
+                            run_id=result.run.id,
+                            renderer=renderer,
+                        )
+                if isinstance(result, RunResult):
+                    await application.conversations.record_if_managed(result)
             renderer.finish()
             if result.output and not renderer.text_streamed:
                 console.print(f"[bold green]agent>[/bold green] {result.output}")
@@ -921,70 +1555,13 @@ async def _chat(
         await application.close()
 
 
-def _build_cli_lease(
-    agent_id: str,
-    allow_write: list[str] | None,
-    allow_command: list[str] | None,
-) -> CapabilityLease:
-    """Build a normalized least-authority lease without expanding the AgentSpec."""
-
-    values: dict[str, object] = {"filesystem_read": (".",)}
-    if agent_id == "coordinator":
-        values.update({"can_delegate": True, "max_child_depth": 2})
-    if agent_id == "coder":
-        values["filesystem_write"] = tuple(allow_write or (".",))
-        values["commands"] = frozenset(allow_command or ())
-    elif allow_write:
-        values["filesystem_write"] = tuple(allow_write)
-    if agent_id != "coder" and allow_command:
-        values["commands"] = frozenset(allow_command)
-    return CapabilityLease.model_validate(values)
-
-
-def _prompt_approval(approval: Approval) -> ApprovalDecision | None:
-    """Display the complete bounded approval envelope and return an explicit decision."""
-
-    console.print(
-        f"[yellow]Approval required[/yellow] agent={approval.agent_name} "
-        f"provider={approval.provider}/{approval.model}"
-    )
-    console.print(f"tool={approval.tool_name} risk={approval.risk.value}")
-    console.print(f"impact: {approval.impact}")
-    console.print(
-        f"idempotent={approval.idempotent} timeout={approval.timeout_seconds}s "
-        f"remaining_tool_calls={approval.remaining_budget.remaining.tool_calls}"
-    )
-    console.print_json(json.dumps(approval.arguments, ensure_ascii=False))
-    if approval.diff:
-        console.print(approval.diff, markup=False)
-    choice = (
-        console.input(
-            "[yellow][a]pprove [t] approve same tool this Run "
-            "[m]odify [r]eject [q] leave pending > [/yellow]"
-        )
-        .strip()
-        .casefold()
-    )
-    if choice in {"a", "approve", "y", "yes"}:
-        return ApprovalDecision(kind=ApprovalDecisionKind.APPROVE)
-    if choice in {"t", "temporary"}:
-        return ApprovalDecision(kind=ApprovalDecisionKind.APPROVE, grant_same_tool=True)
-    if choice in {"m", "modify"}:
-        raw = console.input("[yellow]approved arguments as JSON> [/yellow]")
-        value = TypeAdapter(dict[str, JsonValue]).validate_json(raw)
-        return ApprovalDecision(kind=ApprovalDecisionKind.MODIFY, arguments=value)
-    if choice in {"r", "reject", "n", "no"}:
-        return ApprovalDecision(kind=ApprovalDecisionKind.REJECT)
-    return None
-
-
-async def _await_with_events(
-    execution: Coroutine[Any, Any, RunResult],
+async def _await_with_events[T](
+    execution: Coroutine[Any, Any, T],
     *,
     application: AgentCellApplication,
     run_id: UUID,
     renderer: CliEventRenderer,
-) -> RunResult:
+) -> T:
     """Await one execution while consuming its persisted event stream exactly once."""
 
     task = asyncio.create_task(execution)
@@ -998,6 +1575,7 @@ async def _await_with_events(
                 renderer.render(event)
             if task.done():
                 return await task
+            renderer.tick()
             await asyncio.sleep(0.05)
     finally:
         try:
@@ -1033,23 +1611,63 @@ async def _resume_once(
     run_id: UUID,
     *,
     approval_id: UUID | None,
-    decision: ApprovalDecisionKind,
+    decision: ApprovalDecision | None,
     database_url: str | None,
     config: Path,
     offline_fake: bool,
-) -> Run:
+) -> Run | HandoffResult | TaskExecutionResult:
     application = await build_application(
         config=config,
         database_url=database_url,
         offline_fake=offline_fake,
     )
     try:
+        run = await application.get_run(run_id)
+        if run is None:
+            raise RunNotFoundError(str(run_id))
+        if run.agent_id == TASK_ROUTER_AGENT_ID:
+            if approval_id is None:
+                if decision is not None:
+                    raise ValueError("decision requires --approval-id")
+                routed = await application.routing.resume(run_id)
+            else:
+                if decision is None:
+                    raise ValueError("--approval-id requires an explicit --decision")
+                routed = await application.routing.decide_approval(
+                    run_id,
+                    approval_id,
+                    decision,
+                )
+            await application.conversations.record_task_result(routed)
+            return routed
+        async with application.database.session() as session:
+            checkpoint = await CheckpointRepository(session).latest(run_id)
+        if checkpoint.kind is CheckpointKind.HANDOFF:
+            if approval_id is None:
+                if decision is not None:
+                    raise ValueError("decision requires --approval-id")
+            else:
+                if decision is None:
+                    raise ValueError("--approval-id requires an explicit --decision")
+                return await application.handoffs.decide_approval(
+                    run_id,
+                    approval_id,
+                    decision,
+                )
+            return await application.handoffs.resume(run_id)
         if approval_id is None:
+            if decision is not None:
+                raise ValueError("decision requires --approval-id")
             result = await application.runs.resume_paused(run_id)
         else:
+            if decision is None:
+                raise ValueError("--approval-id requires an explicit --decision")
+            approvals = await application.approvals(run_id)
+            if approval_id not in {approval.id for approval in approvals}:
+                raise ValueError("Approval does not belong to the supplied Run")
             result = await application.runs.resume(
                 approval_id,
-                ApprovalDecision(kind=decision),
+                decision,
             )
         await application.conversations.record_if_managed(result)
         return result.run
@@ -1061,14 +1679,16 @@ async def _list_agents(
     database_url: str | None,
     config: Path,
     offline_fake: bool,
-) -> tuple[AgentSpec, ...]:
+    *,
+    include_internal: bool,
+) -> tuple[RegisteredAgent, ...]:
     application = await build_application(
         config=config,
         database_url=database_url,
         offline_fake=offline_fake,
     )
     try:
-        return application.agents.list()
+        return application.agents.list_entries(include_internal=include_internal)
     finally:
         await application.close()
 
@@ -1107,48 +1727,6 @@ async def _search_memory(
         return await application.memory.search(query, scope=scope, limit=limit)
     finally:
         await application.close()
-
-
-async def _list_changes(run_id: UUID, database_url: str | None) -> tuple[FileChange, ...]:
-    database = _database(database_url)
-    service = ChangeService(database, FileArtifactStore(database, Path(".agentcell/artifacts")))
-    try:
-        return await service.list_for_run(run_id)
-    finally:
-        await database.dispose()
-
-
-async def _change_details(change_id: UUID, database_url: str | None) -> ChangeDetails:
-    database = _database(database_url)
-    service = ChangeService(database, FileArtifactStore(database, Path(".agentcell/artifacts")))
-    try:
-        return await service.details(change_id)
-    finally:
-        await database.dispose()
-
-
-async def _change_reverse_diff(change_id: UUID, database_url: str | None) -> str:
-    database = _database(database_url)
-    service = ChangeService(database, FileArtifactStore(database, Path(".agentcell/artifacts")))
-    try:
-        return await service.reverse_diff(change_id)
-    finally:
-        await database.dispose()
-
-
-async def _revert_change(change_id: UUID, database_url: str | None) -> FileChange:
-    database = _database(database_url)
-    service = ChangeService(database, FileArtifactStore(database, Path(".agentcell/artifacts")))
-    try:
-        details = await service.details(change_id)
-        return await service.revert(
-            change_id,
-            workspace=Path(details.change_set.workspace),
-            lease=CapabilityLease(filesystem_read=(".",), filesystem_write=(".",)),
-            events=RunEventRecorder(database, details.change.run_id),
-        )
-    finally:
-        await database.dispose()
 
 
 async def _replay_once(
@@ -1208,16 +1786,73 @@ async def _cancel_once(run_id: UUID, database_url: str | None) -> Run:
         await database.dispose()
 
 
-def _database(database_url: str | None) -> Database:
-    url = database_url or os.getenv("AGENTCELL_DATABASE_URL")
-    return Database(url) if url else Database.from_path(Path(".agentcell/agentcell.db"))
+def _persisted_status(run_id: UUID, database_url: str | None) -> str | None:
+    try:
+        return asyncio.run(_persisted_status_async(run_id, database_url))
+    except (OSError, SQLAlchemyError):
+        return None
 
 
-def _raise_cli_error(error: Exception) -> NoReturn:
-    console.print(f"[red]Command failed:[/red] {error}")
+async def _persisted_status_async(run_id: UUID, database_url: str | None) -> str | None:
+    database = _database(database_url)
+    try:
+        async with database.session() as session:
+            run = await RunRepository(session).get(run_id)
+        return None if run is None else run.status.value
+    finally:
+        await database.dispose()
+
+
+def _cli_error_code(error: Exception) -> str:
+    if isinstance(error, AgentCellError):
+        return error.code
     if isinstance(error, SQLAlchemyError):
-        console.print("[dim]Apply migrations first: uv run alembic upgrade head[/dim]")
-    raise typer.Exit(code=1) from error
+        return "storage_error"
+    if isinstance(error, OSError):
+        return "io_error"
+    return "invalid_request"
+
+
+def _agent_access(spec: AgentSpec) -> str:
+    labels = {
+        Capability.FILESYSTEM_READ: "read",
+        Capability.FILESYSTEM_WRITE: "write",
+        Capability.SHELL_EXECUTE: "shell",
+        Capability.NETWORK_REQUEST: "network",
+        Capability.AGENT_DELEGATE: "delegate",
+    }
+    return (
+        ",".join(labels[capability] for capability in labels if capability in spec.capabilities)
+        or "none"
+    )
+
+
+def _print_run_failure(
+    *,
+    run_id: UUID,
+    conversation_id: UUID,
+    status: str,
+    error_code: str,
+    json_output: bool,
+) -> None:
+    values = {
+        "run_id": str(run_id),
+        "conversation_id": str(conversation_id),
+        "status": status,
+        "error_code": error_code,
+    }
+    if json_output:
+        console.print(
+            json.dumps(values, ensure_ascii=False),
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        return
+    console.print(
+        f"[dim]run_id={run_id} conversation_id={conversation_id} "
+        f"status={status} error_code={error_code}[/dim]"
+    )
 
 
 def main() -> None:

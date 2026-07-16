@@ -13,6 +13,7 @@ from agentcell.events import (
     ErrorPayload,
     EventType,
     GenericEventPayload,
+    TaskRouteEventPayload,
     TextDeltaPayload,
 )
 
@@ -123,6 +124,7 @@ def test_event_type_catalog_contains_all_required_core_events() -> None:
         "model.text_delta",
         "model.completed",
         "model.failed",
+        "model.output_rejected",
         "tool.proposed",
         "tool.approval_required",
         "tool.approved",
@@ -138,6 +140,10 @@ def test_event_type_catalog_contains_all_required_core_events() -> None:
         "context.compacted",
         "budget.updated",
         "checkpoint.created",
+        "task.route_proposed",
+        "task.route_confirmed",
+        "task.route_overridden",
+        "task.route_rejected",
         "file.change_prepared",
         "file.change_applied",
         "file.change_completed",
@@ -165,4 +171,31 @@ def test_artifact_reference_requires_content_identity_and_size() -> None:
             media_type="text/plain",
             size_bytes=-1,
             sha256="not-a-sha256",
+        )
+
+
+def test_task_route_payload_is_versioned_and_excludes_raw_task_text() -> None:
+    payload = TaskRouteEventPayload(
+        policy_version="9.4.1-v1",
+        task_sha256="a" * 64,
+        decision_hash="b" * 64,
+        mode="single_agent",
+        agent_id="coordinator",
+        source="deterministic",
+        status="ready",
+        confidence=0.93,
+        reason_summary="read-only analysis",
+        required_capabilities=("filesystem.read",),
+        budget_profile="read_only",
+    )
+
+    assert "task" not in payload.model_fields_set
+    assert payload.safe_dump()["task_sha256"] == "a" * 64
+
+    with pytest.raises(ValidationError, match="exactly one"):
+        TaskRouteEventPayload.model_validate(
+            {
+                **payload.model_dump(mode="json"),
+                "team_id": "software",
+            }
         )

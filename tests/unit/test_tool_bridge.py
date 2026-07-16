@@ -11,6 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 from agentcell.budgets import Budget, BudgetTracker
 from agentcell.kernel.deps import RunDeps
+from agentcell.kernel.final_output import FinalOutputState
 from agentcell.kernel.tool_bridge import (
     budget_instructions,
     build_agent_tools,
@@ -48,7 +49,8 @@ def _context(tracker: BudgetTracker) -> RunContext[RunDeps]:
             RunDeps,
             SimpleNamespace(
                 budget=tracker,
-                has_deferred_tool_results=False,
+                deferred_tool_results_at_request=None,
+                final_output=FinalOutputState(),
             ),
         ),
         model=TestModel(),
@@ -74,7 +76,8 @@ def test_final_attempt_window_hides_tools_but_deferred_recovery_keeps_them() -> 
         tracker.reserve_model_request()
     base_deps = SimpleNamespace(
         budget=tracker,
-        has_deferred_tool_results=False,
+        deferred_tool_results_at_request=None,
+        final_output=FinalOutputState(),
     )
     context = RunContext(
         deps=cast(RunDeps, base_deps),
@@ -90,13 +93,39 @@ def test_final_attempt_window_hides_tools_but_deferred_recovery_keeps_them() -> 
             RunDeps,
             SimpleNamespace(
                 budget=base_deps.budget,
-                has_deferred_tool_results=True,
+                deferred_tool_results_at_request=tracker.usage.requests,
+                final_output=FinalOutputState(),
             ),
         ),
         model=TestModel(),
         usage=RunUsage(),
     )
     assert reserve_final_model_request(deferred_context, definition) is definition
+
+    tracker.reserve_model_request()
+
+    assert reserve_final_model_request(deferred_context, definition) is None
+
+
+def test_rejected_final_output_forces_one_no_tool_retry() -> None:
+    definition = ToolDefinition(name="workspace_list")
+    tracker = _tracker(max_requests=10)
+    state = FinalOutputState(force_no_tools=True, rejections=1)
+    context = RunContext(
+        deps=cast(
+            RunDeps,
+            SimpleNamespace(
+                budget=tracker,
+                deferred_tool_results_at_request=None,
+                final_output=state,
+            ),
+        ),
+        model=TestModel(),
+        usage=RunUsage(),
+    )
+
+    assert reserve_final_model_request(context, definition) is None
+    assert "unresolved tool protocol" in budget_instructions(context)
 
 
 def test_small_budget_keeps_one_exploration_request() -> None:
@@ -109,6 +138,29 @@ def test_small_budget_keeps_one_exploration_request() -> None:
     tracker.reserve_model_request()
 
     assert reserve_final_model_request(context, definition) is None
+
+
+def test_five_request_stage_reserves_all_final_output_attempts() -> None:
+    definition = ToolDefinition(name="workspace_list")
+    tracker = _tracker(max_requests=5)
+    context = _context(tracker)
+
+    tracker.reserve_model_request()
+    assert reserve_final_model_request(context, definition) is definition
+
+    tracker.reserve_model_request()
+    assert tracker.remaining.requests == 3
+    assert reserve_final_model_request(context, definition) is None
+
+
+def test_exhausted_tool_budget_hides_tools_for_final_answer() -> None:
+    definition = ToolDefinition(name="workspace_list")
+    tracker = _tracker(max_requests=10, max_tool_calls=1)
+    tracker.reserve_tool_call()
+    context = _context(tracker)
+
+    assert reserve_final_model_request(context, definition) is None
+    assert "reserved final-answer window" in budget_instructions(context)
 
 
 def test_budget_instruction_is_stable_until_final_window() -> None:

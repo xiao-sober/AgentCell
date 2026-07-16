@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from agentcell.errors import InvalidRunTimestampError
+from agentcell.kernel.identity import RunExecutionIdentity
 from agentcell.kernel.lifecycle import RunStatus, ensure_transition
 
 
@@ -36,6 +37,7 @@ class Run(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     conversation_id: UUID
     agent_id: str = Field(min_length=1)
+    execution_identity: RunExecutionIdentity | None = None
     parent_run_id: UUID | None = None
     status: RunStatus = RunStatus.CREATED
     created_at: datetime = Field(default_factory=_utc_now)
@@ -51,6 +53,11 @@ class Run(BaseModel):
     def validate_relationships_and_time(self) -> Run:
         if self.parent_run_id == self.id:
             raise ValueError("parent_run_id cannot equal id")
+        if (
+            self.execution_identity is not None
+            and self.execution_identity.agent_spec.id != self.agent_id
+        ):
+            raise ValueError("agent_id does not match execution identity")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at cannot be earlier than created_at")
         return self

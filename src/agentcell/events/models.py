@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -29,6 +29,9 @@ _SENSITIVE_KEYS = frozenset(
         "privatekey",
         "credentials",
         "xapikey",
+        "reasoningcontent",
+        "thinking",
+        "thought",
     }
 )
 
@@ -42,6 +45,7 @@ class EventType(StrEnum):
     MODEL_TEXT_DELTA = "model.text_delta"
     MODEL_COMPLETED = "model.completed"
     MODEL_FAILED = "model.failed"
+    MODEL_OUTPUT_REJECTED = "model.output_rejected"
     TOOL_PROPOSED = "tool.proposed"
     TOOL_APPROVAL_REQUIRED = "tool.approval_required"
     TOOL_APPROVED = "tool.approved"
@@ -57,6 +61,10 @@ class EventType(StrEnum):
     CONTEXT_COMPACTED = "context.compacted"
     BUDGET_UPDATED = "budget.updated"
     CHECKPOINT_CREATED = "checkpoint.created"
+    TASK_ROUTE_PROPOSED = "task.route_proposed"
+    TASK_ROUTE_CONFIRMED = "task.route_confirmed"
+    TASK_ROUTE_OVERRIDDEN = "task.route_overridden"
+    TASK_ROUTE_REJECTED = "task.route_rejected"
     FILE_CHANGE_PREPARED = "file.change_prepared"
     FILE_CHANGE_APPLIED = "file.change_applied"
     FILE_CHANGE_COMPLETED = "file.change_completed"
@@ -117,6 +125,17 @@ class TextDeltaPayload(EventPayload):
     """A non-empty model or tool output delta."""
 
     delta: str = Field(min_length=1)
+    source_run_id: UUID | None = None
+    source_agent_id: str | None = Field(default=None, min_length=1)
+    source_sequence: int | None = Field(default=None, ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def validate_source_identity(self) -> TextDeltaPayload:
+        source = (self.source_run_id, self.source_agent_id, self.source_sequence)
+        has_source = any(item is not None for item in source)
+        if has_source and not all(item is not None for item in source):
+            raise ValueError("projected text source identity must be complete")
+        return self
 
 
 class ErrorPayload(EventPayload):
@@ -138,6 +157,14 @@ class RunStartedPayload(EventPayload):
 
     conversation_id: UUID
     agent_id: str = Field(min_length=1)
+    team_id: str | None = Field(default=None, min_length=1)
+    team_version: int | None = Field(default=None, ge=1, strict=True)
+    model_ref: str | None = Field(default=None, min_length=1)
+    provider: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1)
+    agent_spec_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_spec_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    budget: dict[str, JsonValue] | None = None
 
 
 class RunStatusChangedPayload(EventPayload):
@@ -203,6 +230,39 @@ class AgentChildCompletedPayload(EventPayload):
     usage: dict[str, JsonValue]
 
 
+class TaskRouteEventPayload(EventPayload):
+    """Auditable route decision without task text or model reasoning."""
+
+    policy_version: str = Field(min_length=1, max_length=64)
+    task_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: str = Field(pattern=r"^(single_agent|team)$")
+    agent_id: str | None = Field(default=None, min_length=1)
+    team_id: str | None = Field(default=None, min_length=1)
+    source: str = Field(pattern=r"^(deterministic|model|override|safe_fallback)$")
+    status: str = Field(pattern=r"^(ready|confirmation_required|rejected)$")
+    confidence: float = Field(ge=0, le=1)
+    reason_summary: str = Field(min_length=1, max_length=500)
+    required_capabilities: tuple[str, ...] = ()
+    capability_gaps: tuple[str, ...] = ()
+    budget_profile: str = Field(pattern=r"^(read_only|change|review|research|delivery)$")
+    requires_confirmation: bool = False
+    issues: tuple[dict[str, JsonValue], ...] = ()
+    routing_usage: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_route_target(self) -> TaskRouteEventPayload:
+        has_agent = self.agent_id is not None
+        has_team = self.team_id is not None
+        if has_agent == has_team:
+            raise ValueError("route event must identify exactly one Agent or Team")
+        if self.mode == "single_agent" and not has_agent:
+            raise ValueError("single_agent route event requires agent_id")
+        if self.mode == "team" and not has_team:
+            raise ValueError("team route event requires team_id")
+        return self
+
+
 class ArtifactReference(BaseModel):
     """Stable reference embedded in events when content is stored outside the event table."""
 
@@ -252,6 +312,10 @@ _PAYLOAD_MODELS: dict[EventType, type[EventPayload]] = {
     EventType.RUN_COMPLETED: RunCompletedPayload,
     EventType.AGENT_CHILD_STARTED: AgentChildStartedPayload,
     EventType.AGENT_CHILD_COMPLETED: AgentChildCompletedPayload,
+    EventType.TASK_ROUTE_PROPOSED: TaskRouteEventPayload,
+    EventType.TASK_ROUTE_CONFIRMED: TaskRouteEventPayload,
+    EventType.TASK_ROUTE_OVERRIDDEN: TaskRouteEventPayload,
+    EventType.TASK_ROUTE_REJECTED: TaskRouteEventPayload,
 }
 
 

@@ -11,7 +11,15 @@ from ag_ui.core import BaseEvent
 from agentcell.api.agui import AgUiEventMapper, AgUiMappingState
 from agentcell.api.sse import StreamCursor
 from agentcell.errors import InvalidEventCursorError
-from agentcell.events import DomainEvent, EventType, GenericEventPayload, JsonValue
+from agentcell.events import (
+    DomainEvent,
+    ErrorPayload,
+    EventPayload,
+    EventType,
+    GenericEventPayload,
+    JsonValue,
+)
+from agentcell.events.models import ModelRequestedPayload, TextDeltaPayload
 
 
 def test_tool_events_keep_provider_call_identity_and_bounded_result() -> None:
@@ -83,3 +91,66 @@ def test_stream_cursor_accepts_composite_ids_and_rejects_invalid_values() -> Non
     )
     with pytest.raises(InvalidEventCursorError):
         StreamCursor.parse("not-a-cursor")
+
+
+def test_agui_uses_safe_display_text_and_redacted_tool_payloads() -> None:
+    run_id = uuid4()
+    mapper = AgUiEventMapper()
+    state = AgUiMappingState(thread_id="thread")
+    events: tuple[DomainEvent[EventPayload], ...] = (
+        cast(
+            DomainEvent[EventPayload],
+            DomainEvent(
+                run_id=run_id,
+                sequence=1,
+                event_type=EventType.MODEL_REQUESTED,
+                payload=ModelRequestedPayload(provider="fake", model="fake", request_index=1),
+            ),
+        ),
+        cast(
+            DomainEvent[EventPayload],
+            DomainEvent(
+                run_id=run_id,
+                sequence=2,
+                event_type=EventType.MODEL_TEXT_DELTA,
+                payload=TextDeltaPayload(delta="answer api_key=topsecret"),
+            ),
+        ),
+        cast(
+            DomainEvent[EventPayload],
+            DomainEvent(
+                run_id=run_id,
+                sequence=3,
+                event_type=EventType.TOOL_COMPLETED,
+                payload=GenericEventPayload(
+                    data={
+                        "call_id": "call-1",
+                        "tool_name": "workspace.read",
+                        "output": "password=tool-secret",
+                        "reasoning_content": "private reasoning",
+                    }
+                ),
+            ),
+        ),
+        cast(
+            DomainEvent[EventPayload],
+            DomainEvent(
+                run_id=run_id,
+                sequence=4,
+                event_type=EventType.RUN_FAILED,
+                payload=ErrorPayload(
+                    code="provider_error",
+                    message="request failed api_key=error-secret",
+                ),
+            ),
+        ),
+    )
+
+    mapped = [item for event in events for item in mapper.map(event, state)]
+    serialized = "\n".join(item.model_dump_json(by_alias=True) for item in mapped)
+    assert "topsecret" not in serialized
+    assert "tool-secret" not in serialized
+    assert "error-secret" not in serialized
+    assert "private reasoning" not in serialized
+    assert "reasoning_content" in serialized
+    assert "[REDACTED]" in serialized

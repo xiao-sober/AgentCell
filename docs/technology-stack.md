@@ -209,10 +209,11 @@ AgentCell DomainEvent
 5. **阶段 9.1，会话线程**：复用 SQLAlchemy、Alembic、PydanticAI 消息历史、现有上下文压缩、FastAPI 和 Typer，不引入新的会话框架；
 6. **阶段 9.2，CLI 执行闭环**：复用 Typer、Rich、现有 EventStore、PolicyEngine、CapabilityLease、审批检查点和 Artifact Store；新增 ChangeSet/FileChange 持久化。Git 增强通过受控 subprocess argv 调用本机 Git，不引入 GitPython，不直接读取 `.git`，Git 不可用时核心审计与回滚仍工作；
 7. **阶段 9.2.1，正确性收口**：不引入新的大型依赖，复用现有 Kernel、Policy、PydanticAI 重试、SQLite 和测试设施；
-8. **阶段 9.2.2，CLI 产品化**：复用 Typer/Rich，新增纯展示投影和 Rich Live，不引入第二套终端 UI 框架；
-9. **阶段 9.3，确定性 Team**：复用现有 Handoff、父子 Run、预算和检查点，不引入工作流框架；
-10. **阶段 10–10.1，Web 工作台与管理补全**：React、TypeScript、Vite、pnpm、TanStack Query、Vitest、Playwright；Zustand 按真实状态需求决定；
-11. **阶段 11，可观测性与交付加固**：OpenTelemetry，并在 structlog 与标准库 logging 之间作出单一选择；同时完成存储保留、高级 Git 和独立回滚 Run。
+8. **阶段 9.2.2，CLI 产品化，已完成**：复用 Typer/Rich，新增不依赖终端框架的纯事件展示投影和单实例 Rich Live；非 TTY 使用同一状态的有界里程碑，没有引入第二套终端 UI 框架；
+9. **阶段 9.3，确定性 Team，已完成**：复用现有 Handoff、父子 Run、预算和检查点，并新增版本化 TeamSpec/Registry 与 CLI Team profile；没有引入工作流框架或新数据库结构；
+10. **阶段 9.4，统一 Task Router，已完成**：复用 PydanticAI 结构化输出、现有 Agent/Team Registry、Policy、Budget、ProviderFactory、Run、EventStore、Checkpoint、AgentDelegation 和 Handoff，实现规则优先/模型回退、任务 root、安全确认、CLI/API 默认入口、fixed/auto Conversation、single-Agent/software-Team child 执行与跨进程恢复，不引入独立路由框架；
+11. **阶段 10–10.1，Web 工作台与管理补全**：React、TypeScript、Vite、pnpm、TanStack Query、Vitest、Playwright；Zustand 按真实状态需求决定；
+12. **阶段 11，可观测性与交付加固**：OpenTelemetry，并在 structlog 与标准库 logging 之间作出单一选择；同时完成存储保留、高级 Git 和独立回滚 Run。
 
 阶段编号以 `docs/development-steps.md` 为准。如果实际垂直切片需要调整顺序，必须在 handoff 中说明原因。
 

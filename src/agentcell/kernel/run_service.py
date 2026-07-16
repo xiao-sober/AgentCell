@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterable, Sequence
@@ -10,17 +11,18 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from opentelemetry import trace
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import (
     AgentRunResult,
     AgentStreamEvent,
     DeferredToolRequests,
     DeferredToolResults,
     ModelMessagesTypeAdapter,
+    ModelRetry,
     RunContext,
     ToolApproved,
     ToolDenied,
@@ -54,8 +56,11 @@ from agentcell.errors import (
     ApprovalConflictError,
     BudgetExceededError,
     CapabilityDeniedError,
+    InvalidFinalOutputError,
     ModelOutputError,
+    ProviderConfigurationError,
     RunExecutionError,
+    RunIdentityMismatchError,
     RunNotFoundError,
     ToolArgumentsError,
 )
@@ -78,6 +83,8 @@ from agentcell.kernel.approval_recorder import RunApprovalRecorder
 from agentcell.kernel.checkpoint import Checkpoint, CheckpointKind
 from agentcell.kernel.deps import RunDeps
 from agentcell.kernel.event_recorder import RunEventRecorder
+from agentcell.kernel.final_output import FinalOutputGuard
+from agentcell.kernel.identity import RunExecutionIdentity
 from agentcell.kernel.lifecycle import RunStatus
 from agentcell.kernel.model_runtime import RunModel
 from agentcell.kernel.models import Run
@@ -114,6 +121,7 @@ from agentcell.storage import (
     SqliteToolExecutionLedger,
 )
 from agentcell.tools import (
+    ToolCall,
     ToolExecutionContext,
     ToolExecutor,
     ToolRegistry,
@@ -186,6 +194,7 @@ class RunRequest(BaseModel):
     user_id: UUID = Field(default_factory=uuid4)
     lease: CapabilityLease = Field(default_factory=CapabilityLease)
     permission_mode: PermissionMode = PermissionMode.REQUEST
+    finalize_after_successful_test: bool = False
     budget: Budget = Field(default_factory=_default_budget)
     run_id: UUID = Field(default_factory=uuid4)
     parent_run_id: UUID | None = None
@@ -243,19 +252,28 @@ class RunService:
         run, spec = await self.prepare(request)
         return await self.execute_prepared(run, request=request, spec=spec)
 
-    async def prepare(self, request: RunRequest) -> tuple[Run, AgentSpec]:
+    async def prepare(
+        self,
+        request: RunRequest,
+        *,
+        model_ref: str | None = None,
+    ) -> tuple[Run, AgentSpec]:
         """Persist a created Run so an orchestrator can link it before execution."""
 
         spec = self._agents.get(request.agent_id)
+        if model_ref is not None and model_ref != spec.model_ref:
+            spec = spec.model_copy(update={"model_ref": model_ref})
         self._authorize_agent(spec, request.lease)
         self._authorize_agent_limits(spec, request.budget)
+        identity = self._capture_identity(request.user_id, spec)
         run = Run(
             id=request.run_id,
             conversation_id=request.conversation_id,
             agent_id=spec.id,
+            execution_identity=identity,
             parent_run_id=request.parent_run_id,
         )
-        await self._create_run(run)
+        await self._create_run(run, budget=request.budget)
         return run, spec
 
     async def execute_prepared(
@@ -312,6 +330,7 @@ class RunService:
             if run is None:
                 raise RunNotFoundError(str(approval.run_id))
             checkpoint = await CheckpointRepository(session).latest(run.id)
+        spec = self._resume_spec(run, checkpoint)
 
         if approval.status is not ApprovalStatus.PENDING:
             self._ensure_same_decision(approval, decision)
@@ -327,10 +346,14 @@ class RunService:
         else:
             if run.status is not RunStatus.WAITING_APPROVAL:
                 raise ApprovalConflictError("Pending approval Run is not waiting")
-            approval = await self._persist_decision(run, approval, decision)
+            approval = await self._persist_decision(
+                run,
+                approval,
+                decision,
+                checkpoint=checkpoint,
+            )
             run = run.transition_to(RunStatus.RUNNING)
 
-        spec = self._agents.get(checkpoint.agent_id)
         workspace = await asyncio.to_thread(
             Path(checkpoint.workspace).resolve,
             strict=True,
@@ -348,6 +371,7 @@ class RunService:
             user_id=checkpoint.user_id,
             lease=checkpoint.lease,
             permission_mode=checkpoint.permission_mode,
+            finalize_after_successful_test=checkpoint.finalize_after_successful_test,
             budget=checkpoint.budget.budget,
             run_id=run.id,
             parent_run_id=run.parent_run_id,
@@ -427,7 +451,7 @@ class RunService:
         if run.status is not RunStatus.PAUSED:
             raise ApprovalConflictError("Branch Run is not paused")
 
-        spec = self._agents.get(checkpoint.agent_id)
+        spec = self._resume_spec(run, checkpoint)
         workspace = await asyncio.to_thread(Path(checkpoint.workspace).resolve, strict=True)
         tracker = BudgetTracker(
             checkpoint.budget.budget,
@@ -443,6 +467,7 @@ class RunService:
             user_id=checkpoint.user_id,
             lease=checkpoint.lease,
             permission_mode=checkpoint.permission_mode,
+            finalize_after_successful_test=checkpoint.finalize_after_successful_test,
             budget=checkpoint.budget.budget,
             run_id=run.id,
             parent_run_id=run.parent_run_id,
@@ -531,20 +556,10 @@ class RunService:
     ) -> DelegationResult:
         """Persist one bounded child Run before deferring its execution."""
 
-        if (
-            context.run_id is None
-            or context.conversation_id is None
-            or context.user_id is None
-            or context.agent_id is None
-        ):
-            raise RunExecutionError("Delegation context is incomplete")
-        parent_spec = self._agents.get(context.agent_id)
-        child_spec = self._agents.get(request.agent_id)
-        if parent_spec.max_children == 0 or parent_spec.max_depth == 0:
-            raise BudgetExceededError("agent.depth", parent_spec.max_depth, 1)
-        context.lease.ensure_child_subset(request.lease)
-        self._authorize_agent(child_spec, request.lease)
-        self._authorize_agent_limits(child_spec, request.budget)
+        _parent_spec, child_spec = await self._delegation_specs(request, context)
+        assert context.run_id is not None
+        assert context.conversation_id is not None
+        assert context.user_id is not None
 
         async with self._database.session() as session:
             existing = await AgentDelegationRepository(session).find_by_parent_call(
@@ -590,6 +605,43 @@ class RunService:
         )
         return self._pending_delegation_result(delegation)
 
+    async def preflight(
+        self,
+        request: DelegationRequest,
+        context: ToolExecutionContext,
+        *,
+        provider_call_id: str,
+    ) -> None:
+        """Validate delegation authority and limits before tool accounting or persistence."""
+
+        del provider_call_id
+        await self._delegation_specs(request, context)
+
+    async def _delegation_specs(
+        self,
+        request: DelegationRequest,
+        context: ToolExecutionContext,
+    ) -> tuple[AgentSpec, AgentSpec]:
+        if (
+            context.run_id is None
+            or context.conversation_id is None
+            or context.user_id is None
+            or context.agent_id is None
+        ):
+            raise RunExecutionError("Delegation context is incomplete")
+        async with self._database.session() as session:
+            parent_run = await RunRepository(session).get(context.run_id)
+        if parent_run is None:
+            raise RunNotFoundError(str(context.run_id))
+        parent_spec = self._resume_spec(parent_run)
+        child_spec = self._agents.get(request.agent_id)
+        if parent_spec.max_children == 0 or parent_spec.max_depth == 0:
+            raise BudgetExceededError("agent.depth", parent_spec.max_depth, 1)
+        context.lease.ensure_child_subset(request.lease)
+        self._authorize_agent(child_spec, request.lease)
+        self._authorize_agent_limits(child_spec, request.budget)
+        return parent_spec, child_spec
+
     async def prepare_delegation(
         self,
         request: RunRequest,
@@ -597,18 +649,24 @@ class RunService:
         provider_call_id: str,
         kind: DelegationKind,
         task: str,
+        model_ref: str | None = None,
     ) -> tuple[Run, AgentSpec, AgentDelegation]:
         """Atomically create a child Run, its delegation, and parent audit event."""
 
         if request.parent_run_id is None or request.depth < 1:
             raise RunExecutionError("Delegated Run must identify its parent and depth")
         spec = self._agents.get(request.agent_id)
+        if model_ref is not None:
+            self._providers.model_spec(model_ref)
+            spec = spec.model_copy(update={"model_ref": model_ref})
         self._authorize_agent(spec, request.lease)
         self._authorize_agent_limits(spec, request.budget)
+        identity = self._capture_identity(request.user_id, spec)
         child = Run(
             id=request.run_id,
             conversation_id=request.conversation_id,
             agent_id=spec.id,
+            execution_identity=identity,
             parent_run_id=request.parent_run_id,
         )
         delegation = AgentDelegation(
@@ -621,6 +679,7 @@ class RunService:
             depth=request.depth,
             lease=request.lease,
             allocated_budget=request.budget,
+            finalize_after_successful_test=request.finalize_after_successful_test,
             status=DelegationStatus.PENDING,
         )
         async with self._database.transaction() as session:
@@ -632,6 +691,7 @@ class RunService:
                 payload=RunStartedPayload(
                     conversation_id=child.conversation_id,
                     agent_id=child.agent_id,
+                    **identity.event_fields(),
                 ),
             )
             await AgentDelegationRepository(session).create(delegation)
@@ -732,6 +792,7 @@ class RunService:
         workspace: Path,
         user_id: UUID,
         conversation_id: UUID,
+        message_history: Sequence[ModelMessage] = (),
     ) -> DelegationResult:
         """Finish, reconcile, or safely fail one durable child execution."""
 
@@ -747,7 +808,7 @@ class RunService:
             return current.result
 
         if child.status is RunStatus.CREATED:
-            spec = self._agents.get(current.target_agent_id)
+            spec = self._resume_spec(child)
             request = RunRequest(
                 prompt=current.task,
                 workspace=workspace,
@@ -756,6 +817,7 @@ class RunService:
                 user_id=user_id,
                 lease=current.lease,
                 budget=current.allocated_budget,
+                finalize_after_successful_test=current.finalize_after_successful_test,
                 run_id=child.id,
                 parent_run_id=current.parent_run_id,
                 depth=current.depth,
@@ -771,7 +833,12 @@ class RunService:
                         "agentcell.agent.depth": current.depth,
                     },
                 ):
-                    outcome = await self.execute_prepared(child, request=request, spec=spec)
+                    outcome = await self.execute_prepared(
+                        child,
+                        request=request,
+                        spec=spec,
+                        message_history=message_history,
+                    )
             except AgentCellError:
                 async with self._database.session() as session:
                     settled = await AgentDelegationRepository(session).get_required(current.id)
@@ -913,6 +980,7 @@ class RunService:
     ) -> RunResult:
         if parent.status is not RunStatus.PAUSED:
             raise RunExecutionError("Delegation parent is not paused")
+        spec = self._resume_spec(parent, checkpoint)
 
         tracker = BudgetTracker(
             checkpoint.budget.budget,
@@ -967,7 +1035,6 @@ class RunService:
             ),
         )
         workspace = await asyncio.to_thread(Path(checkpoint.workspace).resolve, strict=True)
-        spec = self._agents.get(checkpoint.agent_id)
         request = RunRequest(
             prompt=checkpoint.prompt,
             workspace=workspace,
@@ -976,6 +1043,7 @@ class RunService:
             user_id=checkpoint.user_id,
             lease=checkpoint.lease,
             permission_mode=checkpoint.permission_mode,
+            finalize_after_successful_test=checkpoint.finalize_after_successful_test,
             budget=checkpoint.budget.budget,
             run_id=parent.id,
             parent_run_id=parent.parent_run_id,
@@ -1093,6 +1161,7 @@ class RunService:
             memory=MemoryService(self._database, events=recorder),
             depth=request.depth,
             delegation=self,
+            finalize_after_successful_test=request.finalize_after_successful_test,
         )
 
     async def _execute_agent(
@@ -1131,6 +1200,7 @@ class RunService:
         agent = await self._agent_factory.create(
             spec,
             deps_type=RunDeps,
+            output_type=[str, DeferredToolRequests],
             tools=build_agent_tools(
                 self._effective_tool_names(spec, deps.lease),
                 self._tool_registry,
@@ -1138,6 +1208,36 @@ class RunService:
             model=model,
         )
         agent.instructions(budget_instructions)
+
+        async def validate_final_output(
+            context: RunContext[RunDeps],
+            output: str | DeferredToolRequests,
+        ) -> str | DeferredToolRequests:
+            if not isinstance(output, str):
+                return output
+            assessment = FinalOutputGuard.assess(output)
+            if assessment.accepted:
+                return output
+            attempt = context.deps.final_output.reject()
+            encoded = output.encode("utf-8")
+            await recorder.emit(
+                EventType.MODEL_OUTPUT_REJECTED,
+                GenericEventPayload(
+                    data={
+                        "reason": assessment.reason or "unresolved_tool_protocol",
+                        "attempt": attempt,
+                        "output_bytes": len(encoded),
+                        "output_sha256": hashlib.sha256(encoded).hexdigest(),
+                    }
+                ),
+            )
+            if attempt == 1:
+                raise ModelRetry(
+                    "Return a normal final answer only; unresolved tool protocol is not output."
+                )
+            raise InvalidFinalOutputError
+
+        agent.output_validator(validate_final_output)
 
         async def stream_events(
             context: RunContext[RunDeps],
@@ -1160,7 +1260,10 @@ class RunService:
             # newly consumed remaining capacity; BudgetTracker remains authoritative
             # for parent/child aggregate reservations before every actual request.
             request_limit=min(budget.max_requests, spec.max_steps),
-            tool_calls_limit=budget.max_tool_calls,
+            # PydanticAI counts unresolved/unavailable model tool protocol here too.
+            # AgentCell's BudgetTracker reserves the hard limit immediately before
+            # each real tool execution, so keep protocol retries out of that budget.
+            tool_calls_limit=None,
             input_tokens_limit=budget.max_input_tokens,
             output_tokens_limit=budget.max_output_tokens,
             total_tokens_limit=budget.max_total_tokens,
@@ -1168,12 +1271,13 @@ class RunService:
         try:
             run_deps = replace(
                 deps,
-                has_deferred_tool_results=deferred_tool_results is not None,
+                deferred_tool_results_at_request=(
+                    usage_at_start.requests if deferred_tool_results is not None else None
+                ),
             )
             async with asyncio.timeout(budget.max_duration_seconds):
                 result = await agent.run(
                     prompt,
-                    output_type=[str, DeferredToolRequests],
                     deps=run_deps,
                     message_history=message_history,
                     deferred_tool_results=deferred_tool_results,
@@ -1306,10 +1410,12 @@ class RunService:
                     event_sequence=checkpoint_event.sequence,
                     kind=CheckpointKind.DELEGATION,
                     agent_id=spec.id,
+                    execution_identity=run.execution_identity,
                     prompt=request.prompt,
                     workspace=str(request.workspace),
                     lease=request.lease,
                     permission_mode=request.permission_mode,
+                    finalize_after_successful_test=request.finalize_after_successful_test,
                     budget=tracker.snapshot(),
                     messages=serialized_messages,
                     pending_delegation_ids=(delegation.id,),
@@ -1473,10 +1579,12 @@ class RunService:
                 event_sequence=checkpoint_event.sequence,
                 kind=CheckpointKind.APPROVAL,
                 agent_id=spec.id,
+                execution_identity=run.execution_identity,
                 prompt=request.prompt,
                 workspace=str(request.workspace),
                 lease=request.lease,
                 permission_mode=request.permission_mode,
+                finalize_after_successful_test=request.finalize_after_successful_test,
                 budget=tracker.snapshot(),
                 messages=serialized_messages,
                 pending_approval_ids=tuple(approval.id for approval in approvals),
@@ -1531,21 +1639,62 @@ class RunService:
         run: Run,
         approval: Approval,
         decision: ApprovalDecision,
+        *,
+        checkpoint: Checkpoint,
     ) -> Approval:
         arguments = approval.arguments
         status = ApprovalStatus.APPROVED
         event_type = EventType.TOOL_APPROVED
+        preview = None
         if decision.kind is ApprovalDecisionKind.REJECT:
             status = ApprovalStatus.REJECTED
             event_type = EventType.TOOL_REJECTED
         elif decision.kind is ApprovalDecisionKind.MODIFY:
             assert decision.arguments is not None
-            definition = self._tool_registry.get(approval.tool_name)
-            try:
-                definition.params_model.model_validate(decision.arguments)
-            except ValidationError as error:
-                raise ToolArgumentsError(approval.tool_name) from error
             arguments = decision.arguments
+        if status is ApprovalStatus.APPROVED:
+            workspace = await asyncio.to_thread(
+                Path(checkpoint.workspace).resolve,
+                strict=True,
+            )
+            preflight_context = ToolExecutionContext(
+                workspace=workspace,
+                lease=checkpoint.lease,
+                budget=BudgetTracker(
+                    checkpoint.budget.budget,
+                    initial_usage=checkpoint.budget.used,
+                ),
+                events=RunEventRecorder(self._database, run.id),
+                artifacts=self._artifacts,
+                run_id=run.id,
+                conversation_id=run.conversation_id,
+                user_id=checkpoint.user_id,
+                agent_id=checkpoint.agent_id,
+                depth=checkpoint.depth,
+                delegation=self,
+                provider_call_id=approval.provider_call_id,
+            )
+            preview = await self._tool_executor.preflight(
+                ToolCall(
+                    provider_call_id=approval.provider_call_id,
+                    tool_name=approval.tool_name,
+                    arguments=arguments,
+                ),
+                preflight_context,
+            )
+            if decision.kind is ApprovalDecisionKind.APPROVE and preview is not None:
+                original_artifact_hash = (
+                    None if approval.diff_artifact is None else approval.diff_artifact.sha256
+                )
+                preview_artifact_hash = (
+                    None if preview.diff_artifact is None else preview.diff_artifact.sha256
+                )
+                if (approval.diff is not None or approval.diff_artifact is not None) and (
+                    preview.diff != approval.diff or preview_artifact_hash != original_artifact_hash
+                ):
+                    raise ApprovalConflictError(
+                        "Tool state changed after approval was requested; request a new approval"
+                    )
         decided = approval.model_copy(
             update={
                 "status": status,
@@ -1554,6 +1703,13 @@ class RunService:
                 "decision_message": decision.message,
                 "decision_source": ApprovalDecisionSource.HUMAN,
                 "decided_at": datetime.now(UTC),
+                "impact": (
+                    approval.impact if preview is None or preview.impact is None else preview.impact
+                ),
+                "diff": approval.diff if preview is None else preview.diff,
+                "diff_artifact": (
+                    approval.diff_artifact if preview is None else preview.diff_artifact
+                ),
             }
         )
         running = run.transition_to(RunStatus.RUNNING)
@@ -1692,7 +1848,7 @@ class RunService:
                 return Usage.model_validate(snapshot["used"])
         return Usage()
 
-    async def _create_run(self, run: Run) -> None:
+    async def _create_run(self, run: Run, *, budget: Budget) -> None:
         async with self._database.transaction() as session:
             await RunRepository(session).create(run)
             await EventStore(session).append(
@@ -1701,8 +1857,59 @@ class RunService:
                 payload=RunStartedPayload(
                     conversation_id=run.conversation_id,
                     agent_id=run.agent_id,
+                    budget=cast(dict[str, JsonValue], budget.model_dump(mode="json")),
+                    **(
+                        {}
+                        if run.execution_identity is None
+                        else run.execution_identity.event_fields()
+                    ),
                 ),
             )
+
+    def _capture_identity(self, user_id: UUID, spec: AgentSpec) -> RunExecutionIdentity:
+        model_spec = self._providers.model_spec(spec.model_ref)
+        return RunExecutionIdentity.capture(
+            user_id=user_id,
+            agent_spec=spec,
+            model_spec=cast(Any, model_spec),
+        )
+
+    def _resume_spec(
+        self,
+        run: Run,
+        checkpoint: Checkpoint | None = None,
+    ) -> AgentSpec:
+        """Recover the persisted Agent snapshot only after exact model validation."""
+
+        identity = run.execution_identity
+        if identity is None:
+            raise RunIdentityMismatchError(
+                "Run predates execution identity snapshots and cannot be resumed safely"
+            )
+        if checkpoint is not None:
+            if checkpoint.execution_identity is None:
+                raise RunIdentityMismatchError(
+                    "Checkpoint has no execution identity snapshot and cannot be resumed safely"
+                )
+            if checkpoint.execution_identity != identity:
+                raise RunIdentityMismatchError(
+                    "Checkpoint execution identity does not match its Run"
+                )
+            if checkpoint.user_id != identity.user_id:
+                raise RunIdentityMismatchError("Checkpoint user does not match execution identity")
+        if identity.agent_spec.id != run.agent_id:
+            raise RunIdentityMismatchError("Run Agent does not match execution identity")
+        try:
+            current_model = self._providers.model_spec(identity.model_ref)
+        except ProviderConfigurationError as error:
+            raise RunIdentityMismatchError(
+                "Configured model reference for this Run is no longer available"
+            ) from error
+        if not identity.matches_current(model_spec=current_model):
+            raise RunIdentityMismatchError(
+                "Configured model no longer matches the Run execution identity"
+            )
+        return identity.agent_spec
 
     async def _transition(self, run: Run, status: RunStatus) -> Run:
         transitioned = run.transition_to(status)

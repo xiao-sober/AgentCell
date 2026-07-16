@@ -15,12 +15,17 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agentcell.agents import (
     AgentRegistry,
+    AgentSource,
     AgentSpec,
+    AgentVisibility,
+    TeamRegistry,
+    assistant_spec,
     coder_spec,
     coordinator_spec,
     finalizer_spec,
     researcher_spec,
     reviewer_spec,
+    software_team_spec,
     summarizer_spec,
 )
 from agentcell.changes.service import ChangeService
@@ -28,11 +33,12 @@ from agentcell.config import AgentCellSettings
 from agentcell.conversations.service import ConversationService, PreparedConversationTurn
 from agentcell.errors import AgentRegistrationError, ConversationConflictError
 from agentcell.events import DomainEvent, EventPayload
+from agentcell.kernel.handoff import HandoffService
 from agentcell.kernel.models import Run
 from agentcell.kernel.replay import ReplayService
-from agentcell.kernel.run_service import RunRequest, RunResult, RunService
+from agentcell.kernel.run_service import RunRequest, RunService
 from agentcell.memory.service import MemoryService
-from agentcell.policy import Approval, ApprovalStatus
+from agentcell.policy import Approval, ApprovalDecision, ApprovalStatus
 from agentcell.providers import (
     FakeModelSpec,
     FakeProviderAdapter,
@@ -42,7 +48,9 @@ from agentcell.providers import (
     ProviderFactory,
     ProviderName,
 )
+from agentcell.routing import TASK_ROUTER_AGENT_ID, PreparedTaskRoute, TaskRoutingService
 from agentcell.storage import (
+    AgentDelegationRepository,
     AgentSpecRepository,
     ApprovalRepository,
     ConversationRepository,
@@ -64,7 +72,7 @@ class RunSupervisor:
     """Own in-process Run tasks while persisted events remain the source of truth."""
 
     runs: RunService
-    _tasks: dict[UUID, asyncio.Task[RunResult]] = field(
+    _tasks: dict[UUID, asyncio.Task[object]] = field(
         default_factory=lambda: {},
     )
 
@@ -79,7 +87,7 @@ class RunSupervisor:
     def start_prepared(
         self,
         run: Run,
-        execution: Coroutine[Any, Any, RunResult],
+        execution: Coroutine[Any, Any, object],
     ) -> None:
         task = asyncio.create_task(
             execution,
@@ -100,7 +108,7 @@ class RunSupervisor:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
 
-    def _finish(self, run_id: UUID, task: asyncio.Task[RunResult]) -> None:
+    def _finish(self, run_id: UUID, task: asyncio.Task[object]) -> None:
         self._tasks.pop(run_id, None)
         if not task.cancelled():
             task.exception()
@@ -113,6 +121,7 @@ class AgentCellApplication:
     database: Database
     providers: ProviderFactory
     agents: AgentRegistry
+    teams: TeamRegistry
     tools: ToolRegistry
     runs: RunService
     replay: ReplayService
@@ -122,13 +131,29 @@ class AgentCellApplication:
     owns_resources: bool = True
     supervisor: RunSupervisor = field(init=False)
     conversations: ConversationService = field(init=False)
+    handoffs: HandoffService = field(init=False)
+    routing: TaskRoutingService = field(init=False)
 
     def __post_init__(self) -> None:
         self.supervisor = RunSupervisor(self.runs)
+        self.handoffs = HandoffService(self.database, self.runs)
+        self.routing = TaskRoutingService(
+            database=self.database,
+            agents=self.agents,
+            teams=self.teams,
+            providers=self.providers,
+            runs=self.runs,
+            handoffs=self.handoffs,
+            routing_model_ref=next(iter(self.model_specs)),
+        )
         self.conversations = ConversationService(
             database=self.database,
             runs=self.runs,
             agents=self.agents,
+            teams=self.teams,
+            routing=self.routing,
+            model_refs=self.model_specs,
+            default_model_ref=next(iter(self.model_specs)),
         )
 
     async def start_conversation_turn(self, prepared: PreparedConversationTurn) -> Run:
@@ -137,6 +162,20 @@ class AgentCellApplication:
             self.conversations.execute_prepared(prepared),
         )
         return prepared.run
+
+    async def start_routed_conversation_turn(self, prepared: PreparedTaskRoute) -> Run:
+        self.supervisor.start_prepared(
+            prepared.root,
+            self.conversations.execute_routed_prepared(prepared),
+        )
+        return prepared.root
+
+    async def start_task(self, prepared: PreparedTaskRoute) -> Run:
+        self.supervisor.start_prepared(
+            prepared.root,
+            self.routing.execute(prepared),
+        )
+        return prepared.root
 
     async def start_run(self, request: RunRequest) -> Run:
         """Start a standalone Run without bypassing managed Conversation semantics."""
@@ -174,6 +213,25 @@ class AgentCellApplication:
         async with self.database.session() as session:
             return await ApprovalRepository(session).list_for_run(run_id, status=status)
 
+    async def decide_approval(self, approval_id: UUID, decision: ApprovalDecision) -> Run:
+        """Resume a direct Run or reconcile the routed parent owning its child approval."""
+
+        async with self.database.session() as session:
+            approval = await ApprovalRepository(session).get_required(approval_id)
+            delegation = await AgentDelegationRepository(session).find_by_child(approval.run_id)
+            parent = (
+                None
+                if delegation is None
+                else await RunRepository(session).get(delegation.parent_run_id)
+            )
+        if parent is not None and parent.agent_id == TASK_ROUTER_AGENT_ID:
+            result = await self.routing.decide_approval(parent.id, approval_id, decision)
+            await self.conversations.record_task_result(result)
+            return result.run
+        result = await self.runs.resume(approval_id, decision)
+        await self.conversations.record_if_managed(result)
+        return result.run
+
     def has_agent(self, agent_id: str) -> bool:
         return any(spec.id == agent_id for spec in self.agents.list())
 
@@ -184,14 +242,19 @@ class AgentCellApplication:
             raise AgentRegistrationError(f"Agent {spec.id!r} is already registered")
         async with self.database.transaction() as session:
             await AgentSpecRepository(session).create(spec)
-        self.agents.register(spec)
+        self.agents.register(spec, source=AgentSource.PERSISTED)
         return spec
 
     async def update_agent(self, spec: AgentSpec) -> AgentSpec:
-        self.agents.get(spec.id)
+        current = self.agents.get_entry(spec.id)
         async with self.database.transaction() as session:
             await AgentSpecRepository(session).save(spec)
-        self.agents.replace(spec)
+        self.agents.replace(
+            spec,
+            source=(
+                AgentSource.OVERRIDE if current.source is AgentSource.BUILTIN else current.source
+            ),
+        )
         return spec
 
     async def healthy(self) -> bool:
@@ -244,9 +307,9 @@ async def build_application(
         persisted_agents = await AgentSpecRepository(session).list()
     for spec in persisted_agents:
         if any(item.id == spec.id for item in agents.list()):
-            agents.replace(spec)
+            agents.replace(spec, source=AgentSource.OVERRIDE)
         else:
-            agents.register(spec)
+            agents.register(spec, source=AgentSource.PERSISTED)
     tools = _default_tools()
     runs = RunService(database=database, providers=providers, agents=agents, tools=tools)
     changes = ChangeService(database, FileArtifactStore(database, Path(".agentcell/artifacts")))
@@ -254,6 +317,7 @@ async def build_application(
         database=database,
         providers=providers,
         agents=agents,
+        teams=TeamRegistry((software_team_spec(model_ref=selected_ref),)),
         tools=tools,
         runs=runs,
         replay=ReplayService(database),
@@ -264,15 +328,29 @@ async def build_application(
 
 
 def _builtin_agents(model_ref: str) -> AgentRegistry:
-    specs: tuple[AgentSpec, ...] = (
-        coordinator_spec(model_ref=model_ref, collaborative=True),
+    registry = AgentRegistry()
+    for spec in (
+        assistant_spec(model_ref=model_ref),
+        coordinator_spec(model_ref=model_ref, collaborative=False),
         coder_spec(model_ref=model_ref),
         reviewer_spec(model_ref=model_ref),
         researcher_spec(model_ref=model_ref),
+    ):
+        registry.register(
+            spec,
+            source=AgentSource.BUILTIN,
+            visibility=AgentVisibility.PUBLIC,
+        )
+    for spec in (
         summarizer_spec(model_ref=model_ref),
         finalizer_spec(model_ref=model_ref),
-    )
-    return AgentRegistry(specs)
+    ):
+        registry.register(
+            spec,
+            source=AgentSource.BUILTIN,
+            visibility=AgentVisibility.INTERNAL,
+        )
+    return registry
 
 
 def _default_tools() -> ToolRegistry:

@@ -36,8 +36,13 @@ from agentcell.tools.registry import ToolRegistry
 from agentcell.tools.shell import (
     ShellRunParams,
     ShellRunResult,
+    ShellTestResult,
+    TestExecutionEvidence,
+    assess_test_execution,
+    is_successful_test_result,
     register_shell_tools,
     shell_run,
+    shell_test,
 )
 from agentcell.tools.workspace import (
     WorkspaceDeleteParams,
@@ -92,6 +97,8 @@ __all__ = [
     "ToolResult",
     "ShellRunParams",
     "ShellRunResult",
+    "ShellTestResult",
+    "TestExecutionEvidence",
     "WorkspaceEntry",
     "WorkspaceDeleteParams",
     "WorkspaceListParams",
@@ -113,6 +120,9 @@ __all__ = [
     "register_http_tools",
     "register_delegation_tool",
     "shell_run",
+    "shell_test",
+    "assess_test_execution",
+    "is_successful_test_result",
     "workspace_list",
     "workspace_delete",
     "workspace_patch",

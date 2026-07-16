@@ -38,11 +38,12 @@ from agentcell.providers import (
     FakeToolCallStep,
     ProviderFactory,
 )
-from agentcell.storage import CheckpointRepository, Database, FileArtifactStore
+from agentcell.storage import CheckpointRepository, Database, EventStore, FileArtifactStore
 from agentcell.tools import (
     HostResolver,
     HttpRequestParams,
     ShellRunResult,
+    ShellTestResult,
     ToolCall,
     ToolExecutionContext,
     ToolExecutor,
@@ -283,6 +284,54 @@ async def test_shell_uses_argv_allowlist_minimal_environment_and_artifact(
             context,
             approval_granted=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_shell_test_distinguishes_collection_from_execution(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_shell_tools(registry)
+    executor = ToolExecutor(registry)
+    context = _context(
+        tmp_path,
+        lease=CapabilityLease(
+            filesystem_read=(".",),
+            filesystem_write=(".",),
+            commands=frozenset({"pytest"}),
+        ),
+    )
+
+    collected = await executor.execute(
+        ToolCall(
+            tool_name="shell.test",
+            arguments={
+                "command": "pytest",
+                "args": ["test_sample.py", "--collect-only", "-q"],
+            },
+        ),
+        context,
+        approval_granted=True,
+    )
+    executed = await executor.execute(
+        ToolCall(
+            tool_name="shell.test",
+            arguments={"command": "pytest", "args": ["test_sample.py", "-q"]},
+        ),
+        context,
+        approval_granted=True,
+    )
+
+    collected_result = ShellTestResult.model_validate(collected.output)
+    executed_result = ShellTestResult.model_validate(executed.output)
+    assert collected_result.exit_code == 0
+    assert collected_result.test_execution.collected_only is True
+    assert collected_result.test_execution.executed is False
+    assert executed_result.exit_code == 0
+    assert executed_result.test_execution.executed is True
+    assert executed_result.test_execution.successful is True
     with pytest.raises(ShellCommandDeniedError):
         await executor.execute(
             ToolCall(
@@ -503,6 +552,72 @@ async def test_workspace_patch_diff_survives_approval_restart(
 
     assert completed.run.status.value == "completed"
     assert target.read_text(encoding="utf-8") == "after"
+
+
+@pytest.mark.asyncio
+async def test_changed_workspace_state_is_rejected_before_approval_is_persisted(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "state.txt"
+    target.write_text("before", encoding="utf-8")
+    arguments: dict[str, JsonValue] = {
+        "path": "state.txt",
+        "content": "after",
+        "expected_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+    }
+    first, providers = _workspace_run_service(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.write",
+                    arguments=arguments,
+                    tool_call_id="write-stale-approval-1",
+                ),
+            )
+        ),
+        tool_name="workspace.write",
+        artifact_root=tmp_path / "artifacts",
+    )
+    try:
+        waiting = await first.run(
+            RunRequest(
+                prompt="replace state",
+                workspace=tmp_path,
+                agent_id="operator",
+                lease=CapabilityLease(
+                    filesystem_read=(".",),
+                    filesystem_write=(".",),
+                ),
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    target.write_text("user edit", encoding="utf-8")
+    restarted, restarted_providers = _workspace_run_service(
+        database,
+        FakeScript(steps=(FakeTextStep(text="must not execute"),)),
+        tool_name="workspace.write",
+        artifact_root=tmp_path / "artifacts",
+    )
+    try:
+        with pytest.raises(WorkspaceStateConflictError):
+            await restarted.resume(
+                waiting.approvals[0].id,
+                ApprovalDecision(kind=ApprovalDecisionKind.APPROVE),
+            )
+        stored = await restarted.get(waiting.run.id)
+    finally:
+        await restarted_providers.aclose()
+
+    assert stored is not None
+    assert stored.status.value == "waiting_approval"
+    assert target.read_text(encoding="utf-8") == "user edit"
+    async with database.session() as session:
+        events = await EventStore(session).list_for_run(waiting.run.id)
+    assert EventType.TOOL_APPROVED not in {event.event_type for event in events}
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from agentcell.policy import Capability
 
@@ -29,3 +29,9 @@ class AgentSpec(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("Agent tools must be unique")
         return value
+
+    @field_serializer("capabilities", when_used="json")
+    def serialize_capabilities(self, value: frozenset[Capability]) -> list[str]:
+        """Serialize an unordered capability set deterministically across processes."""
+
+        return sorted(item.value for item in value)

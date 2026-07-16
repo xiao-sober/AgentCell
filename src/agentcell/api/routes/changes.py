@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter
@@ -52,7 +51,5 @@ async def revert_change(
     details = await application.changes.details(change_id)
     return await application.changes.revert(
         change_id,
-        workspace=Path(details.change_set.workspace),
-        lease=body.lease,
         events=RunEventRecorder(application.database, details.change.run_id),
     )

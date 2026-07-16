@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -11,9 +12,13 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agentcell.errors import ShellCommandDeniedError, ShellOutputTooLargeError
+from agentcell.errors import (
+    ShellCommandDeniedError,
+    ShellCommandLeaseMismatchError,
+    ShellOutputTooLargeError,
+)
 from agentcell.policy import Capability, RiskLevel, ToolPolicy
-from agentcell.tools.models import ToolDefinition, ToolExecutionContext
+from agentcell.tools.models import ToolApprovalPreview, ToolDefinition, ToolExecutionContext
 from agentcell.tools.registry import ToolRegistry
 from agentcell.tools.workspace import WorkspacePathResolver
 
@@ -27,6 +32,11 @@ _ENVIRONMENT_ALLOWLIST = (
     "VIRTUAL_ENV",
     "PYTHONUTF8",
     "PYTHONIOENCODING",
+)
+_PYTEST_COLLECTION_FLAGS = frozenset({"--collect-only", "--co"})
+_PYTEST_EXECUTION_SUMMARY = re.compile(
+    r"\b\d+\s+(?:passed|failed|skipped|xfailed|xpassed|errors?)\b",
+    re.IGNORECASE,
 )
 
 
@@ -64,6 +74,22 @@ class ShellRunResult(BaseModel):
     output_bytes: int = Field(ge=0)
 
 
+class TestExecutionEvidence(BaseModel):
+    """Conservative structured evidence that a test command executed rather than inspected."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    framework: str | None = None
+    executed: bool = False
+    successful: bool = False
+    collected_only: bool = False
+    summary: str | None = Field(default=None, max_length=500)
+
+
+class ShellTestResult(ShellRunResult):
+    test_execution: TestExecutionEvidence
+
+
 @dataclass(slots=True)
 class _CaptureBudget:
     limit: int
@@ -79,24 +105,7 @@ async def shell_run(
     params: ShellRunParams,
     context: ToolExecutionContext,
 ) -> ShellRunResult:
-    command = params.command.casefold()
-    if command not in context.lease.commands:
-        raise ShellCommandDeniedError(params.command)
-    resolver = WorkspacePathResolver(context.workspace)
-    cwd = resolver.resolve_read(
-        params.cwd,
-        allowed_scopes=context.lease.filesystem_read,
-        expected="directory",
-    )
-    environment = {name: os.environ[name] for name in _ENVIRONMENT_ALLOWLIST if name in os.environ}
-    environment.setdefault("PYTHONUTF8", "1")
-    environment.setdefault("PYTHONIOENCODING", "utf-8")
-    environment["PATH"] = _sanitized_path(environment.get("PATH", ""))
-    if not environment["PATH"]:
-        raise ShellCommandDeniedError(params.command)
-    executable = shutil.which(params.command, path=environment["PATH"])
-    if executable is None:
-        raise ShellCommandDeniedError(params.command)
+    resolver, cwd, environment, executable = _prepare_shell(params, context)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     process = await asyncio.create_subprocess_exec(
         executable,
@@ -130,6 +139,112 @@ async def shell_run(
         stderr=stderr.decode("utf-8", errors="replace"),
         output_bytes=len(stdout) + len(stderr),
     )
+
+
+async def shell_test(
+    params: ShellRunParams,
+    context: ToolExecutionContext,
+) -> ShellTestResult:
+    """Run a test command and attach conservative execution evidence for orchestration."""
+
+    result = await shell_run(params, context)
+    return ShellTestResult(
+        **result.model_dump(),
+        test_execution=assess_test_execution(result),
+    )
+
+
+def assess_test_execution(result: ShellRunResult) -> TestExecutionEvidence:
+    """Recognize an actually executed pytest run; unknown formats never enable fast finalization."""
+
+    command = tuple(part.casefold() for part in result.command)
+    if not _is_pytest_command(command):
+        return TestExecutionEvidence()
+    pytest_args = command[1:] if command[0] in {"pytest", "pytest.exe"} else command[3:]
+    collected_only = any(
+        argument in _PYTEST_COLLECTION_FLAGS
+        or any(argument.startswith(f"{flag}=") for flag in _PYTEST_COLLECTION_FLAGS)
+        for argument in pytest_args
+    )
+    summary = _execution_summary(f"{result.stdout}\n{result.stderr}")
+    executed = not collected_only and summary is not None
+    return TestExecutionEvidence(
+        framework="pytest",
+        executed=executed,
+        successful=executed and result.exit_code == 0,
+        collected_only=collected_only,
+        summary=summary,
+    )
+
+
+def is_successful_test_result(value: object) -> bool:
+    """Return true only for internally structured evidence of an executed successful test run."""
+
+    try:
+        result = ShellTestResult.model_validate(value)
+    except (TypeError, ValueError):
+        return False
+    evidence = result.test_execution
+    return (
+        result.exit_code == 0
+        and evidence.executed
+        and evidence.successful
+        and not evidence.collected_only
+    )
+
+
+def _is_pytest_command(command: tuple[str, ...]) -> bool:
+    if not command:
+        return False
+    if command[0] in {"pytest", "pytest.exe"}:
+        return True
+    return (
+        len(command) >= 3
+        and command[0] in {"python", "python.exe", "python3", "python3.exe"}
+        and command[1:3] == ("-m", "pytest")
+    )
+
+
+def _execution_summary(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        normalized = line.strip()
+        if _PYTEST_EXECUTION_SUMMARY.search(normalized):
+            return normalized[:500]
+    return None
+
+
+async def preflight_shell_run(
+    params: ShellRunParams,
+    context: ToolExecutionContext,
+) -> ToolApprovalPreview:
+    resolver, cwd, _environment, _executable = _prepare_shell(params, context)
+    rendered = " ".join((params.command, *params.args))
+    return ToolApprovalPreview(impact=f"Run {rendered[:1000]} in {resolver.relative_name(cwd)}")
+
+
+def _prepare_shell(
+    params: ShellRunParams,
+    context: ToolExecutionContext,
+) -> tuple[WorkspacePathResolver, Path, dict[str, str], str]:
+    command = params.command.casefold()
+    if command not in context.lease.commands:
+        raise ShellCommandLeaseMismatchError(params.command)
+    resolver = WorkspacePathResolver(context.workspace)
+    cwd = resolver.resolve_read(
+        params.cwd,
+        allowed_scopes=context.lease.filesystem_read,
+        expected="directory",
+    )
+    environment = {name: os.environ[name] for name in _ENVIRONMENT_ALLOWLIST if name in os.environ}
+    environment.setdefault("PYTHONUTF8", "1")
+    environment.setdefault("PYTHONIOENCODING", "utf-8")
+    environment["PATH"] = _sanitized_path(environment.get("PATH", ""))
+    if not environment["PATH"]:
+        raise ShellCommandDeniedError(params.command)
+    executable = shutil.which(params.command, path=environment["PATH"])
+    if executable is None:
+        raise ShellCommandDeniedError(params.command)
+    return resolver, cwd, environment, executable
 
 
 def _sanitized_path(value: str) -> str:
@@ -184,6 +299,7 @@ def register_shell_tools(registry: ToolRegistry) -> None:
             params_model=ShellRunParams,
             policy=run_policy,
             handler=shell_run,
+            preflight=preflight_shell_run,
         )
     )
     registry.register(
@@ -194,6 +310,7 @@ def register_shell_tools(registry: ToolRegistry) -> None:
             ),
             params_model=ShellRunParams,
             policy=run_policy,
-            handler=shell_run,
+            handler=shell_test,
+            preflight=preflight_shell_run,
         )
     )

@@ -17,6 +17,7 @@ from agentcell.events import (
     RunStatusChangedPayload,
 )
 from agentcell.kernel.checkpoint import Checkpoint, CheckpointKind
+from agentcell.kernel.identity import RunExecutionIdentity
 from agentcell.kernel.lifecycle import RunStatus
 from agentcell.kernel.models import Run
 from agentcell.kernel.replay import ReplayService
@@ -109,7 +110,19 @@ async def test_branch_references_only_requested_source_prefix(
     database: Database,
     tmp_path: Path,
 ) -> None:
-    source = Run(conversation_id=uuid4(), agent_id="coordinator")
+    model = FakeModelSpec(model="branch-resume")
+    agent = coordinator_spec(model_ref="fake")
+    user_id = uuid4()
+    identity = RunExecutionIdentity.capture(
+        user_id=user_id,
+        agent_spec=agent,
+        model_spec=model,
+    )
+    source = Run(
+        conversation_id=uuid4(),
+        agent_id="coordinator",
+        execution_identity=identity,
+    )
     running = source.transition_to(RunStatus.RUNNING)
     waiting = running.transition_to(RunStatus.WAITING_APPROVAL)
     async with database.transaction() as session:
@@ -141,10 +154,11 @@ async def test_branch_references_only_requested_source_prefix(
         await CheckpointRepository(session).create(
             Checkpoint(
                 run_id=source.id,
-                user_id=uuid4(),
+                user_id=user_id,
                 event_sequence=checkpoint_event.sequence,
                 kind=CheckpointKind.APPROVAL,
                 agent_id=source.agent_id,
+                execution_identity=identity,
                 prompt="continue",
                 workspace=str(tmp_path),
                 lease=CapabilityLease(filesystem_read=(".",)),
@@ -174,7 +188,6 @@ async def test_branch_references_only_requested_source_prefix(
     assert checkpoint.source_sequence == 3
     assert checkpoint.run_status is RunStatus.PAUSED
 
-    model = FakeModelSpec(model="branch-resume")
     providers = ProviderFactory(
         {"fake": model},
         adapters=(
@@ -188,7 +201,7 @@ async def test_branch_references_only_requested_source_prefix(
     service = RunService(
         database=database,
         providers=providers,
-        agents=AgentRegistry((coordinator_spec(model_ref="fake"),)),
+        agents=AgentRegistry((agent,)),
         tools=tools,
     )
     try:

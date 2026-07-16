@@ -162,8 +162,6 @@ async def test_revert_creates_reverse_record_and_refuses_newer_user_edits(
     with pytest.raises(ChangeConflictError):
         await service.revert(
             original.id,
-            workspace=workspace,
-            lease=context.lease,
             events=events,
         )
     assert (workspace / "hello.txt").read_text(encoding="utf-8") == "user\n"
@@ -171,8 +169,6 @@ async def test_revert_creates_reverse_record_and_refuses_newer_user_edits(
     (workspace / "hello.txt").write_bytes(b"agent\n")
     reverse = await service.revert(
         original.id,
-        workspace=workspace,
-        lease=context.lease,
         events=events,
     )
     assert not (workspace / "hello.txt").exists()
@@ -184,8 +180,6 @@ async def test_revert_creates_reverse_record_and_refuses_newer_user_edits(
     with pytest.raises(ChangeConflictError):
         await service.revert(
             original.id,
-            workspace=workspace,
-            lease=context.lease,
             events=events,
         )
 
@@ -230,15 +224,21 @@ async def test_change_api_queries_and_explicit_revert(
             diff = await client.get(f"/api/changes/{change.id}/diff")
             assert diff.status_code == 200
             assert "+api" in diff.text
-            reverted = await client.post(
+            client_scoped = await client.post(
                 f"/api/changes/{change.id}/revert",
                 json={
                     "confirm": True,
                     "lease": {
-                        "filesystem_read": ["."],
-                        "filesystem_write": ["."],
+                        "filesystem_read": ["../outside"],
+                        "filesystem_write": ["../outside"],
                     },
                 },
+            )
+            assert client_scoped.status_code == 422
+            assert (workspace / "api.txt").exists()
+            reverted = await client.post(
+                f"/api/changes/{change.id}/revert",
+                json={"confirm": True},
             )
             assert reverted.status_code == 200, reverted.text
             assert reverted.json()["reverts_change_id"] == str(change.id)

@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agentcell.agents import AgentSpec
 from agentcell.budgets import Budget
-from agentcell.conversations import Conversation, ConversationMessage, ConversationMessageKind
+from agentcell.conversations import (
+    Conversation,
+    ConversationMessage,
+    ConversationMessageKind,
+    ConversationRoutingMode,
+)
 from agentcell.events import JsonValue
 from agentcell.kernel.lifecycle import RunStatus
 from agentcell.kernel.models import Run
@@ -24,16 +29,13 @@ from agentcell.policy import (
     PermissionMode,
     RiskLevel,
 )
+from agentcell.routing import TaskRouteDecision
 
 
 def _default_coordinator_lease() -> CapabilityLease:
-    """Grant only read access and bounded delegation to the default coordinator."""
+    """Grant read-only authority to the default single-Agent coordinator."""
 
-    return CapabilityLease(
-        filesystem_read=(".",),
-        can_delegate=True,
-        max_child_depth=2,
-    )
+    return CapabilityLease(filesystem_read=(".",))
 
 
 class ProblemDetails(BaseModel):
@@ -46,6 +48,9 @@ class ProblemDetails(BaseModel):
     code: str
     instance: str | None = None
     retryable: bool = False
+    run_id: UUID | None = None
+    conversation_id: UUID | None = None
+    run_status: RunStatus | None = None
 
 
 class RunCreateRequest(BaseModel):
@@ -75,7 +80,15 @@ class RunResponse(BaseModel):
 
     @classmethod
     def from_domain(cls, run: Run) -> RunResponse:
-        return cls.model_validate(run.model_dump())
+        return cls(
+            id=run.id,
+            conversation_id=run.conversation_id,
+            agent_id=run.agent_id,
+            parent_run_id=run.parent_run_id,
+            status=run.status,
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+        )
 
 
 class ConversationCreateRequest(BaseModel):
@@ -84,6 +97,9 @@ class ConversationCreateRequest(BaseModel):
     user_id: UUID
     workspace: Path
     agent_id: str = "coordinator"
+    routing_mode: ConversationRoutingMode = ConversationRoutingMode.FIXED
+    team_id: str | None = Field(default=None, min_length=1, max_length=255)
+    model_ref: str | None = Field(default=None, min_length=1, max_length=255)
     project_id: str | None = Field(default=None, min_length=1, max_length=512)
     title: str | None = Field(default=None, max_length=255)
     conversation_id: UUID = Field(default_factory=uuid4)
@@ -98,6 +114,9 @@ class ConversationTurnRequest(BaseModel):
     lease: CapabilityLease = Field(default_factory=_default_coordinator_lease)
     permission_mode: PermissionMode = PermissionMode.REQUEST
     budget: Budget | None = None
+    model_ref: str | None = Field(default=None, min_length=1, max_length=255)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=255)
+    team_id: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class ConversationResponse(BaseModel):
@@ -108,6 +127,10 @@ class ConversationResponse(BaseModel):
     project_id: str
     workspace: str
     agent_id: str
+    routing_mode: ConversationRoutingMode
+    team_id: str | None
+    routing_policy_version: str | None
+    model_ref: str | None
     title: str | None
     active_run_id: UUID | None
     created_at: datetime
@@ -141,6 +164,38 @@ class ResumeRunRequest(BaseModel):
 
     approval_id: UUID | None = None
     decision: ApprovalDecision | None = None
+
+
+class TaskRoutePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task: str = Field(min_length=1, max_length=32_000)
+    workspace: Path
+    lease: CapabilityLease = Field(default_factory=_default_coordinator_lease)
+    permission_mode: PermissionMode = PermissionMode.REQUEST
+    budget: Budget | None = None
+    user_id: UUID = Field(default_factory=uuid4)
+    conversation_id: UUID = Field(default_factory=uuid4)
+    root_run_id: UUID = Field(default_factory=uuid4)
+    project_id: str | None = Field(default=None, min_length=1, max_length=512)
+    model_ref: str | None = Field(default=None, min_length=1, max_length=255)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=255)
+    team_id: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class TaskRouteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    authoritative: bool
+    run: RunResponse | None = None
+    decision: TaskRouteDecision
+
+
+class TaskRouteConfirmationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorized_lease: CapabilityLease | None = None
 
 
 class BranchRunRequest(BaseModel):
@@ -179,12 +234,11 @@ class ApprovalDecisionRequest(BaseModel):
 
 
 class ChangeRevertRequest(BaseModel):
-    """Explicit human confirmation and lease for one hash-safe reverse change."""
+    """Explicit human confirmation for one server-scoped, hash-safe reverse change."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     confirm: Literal[True]
-    lease: CapabilityLease
 
 
 class AgentWriteRequest(BaseModel):

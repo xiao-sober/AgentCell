@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentcell.events import JsonValue
 
@@ -14,6 +14,11 @@ from agentcell.events import JsonValue
 class ConversationMessageKind(StrEnum):
     REQUEST = "request"
     RESPONSE = "response"
+
+
+class ConversationRoutingMode(StrEnum):
+    FIXED = "fixed"
+    AUTO = "auto"
 
 
 class Conversation(BaseModel):
@@ -26,6 +31,10 @@ class Conversation(BaseModel):
     project_id: str = Field(min_length=1, max_length=512)
     workspace: str = Field(min_length=1, max_length=2048)
     agent_id: str = Field(min_length=1, max_length=255)
+    routing_mode: ConversationRoutingMode = ConversationRoutingMode.FIXED
+    team_id: str | None = Field(default=None, min_length=1, max_length=255)
+    routing_policy_version: str | None = Field(default=None, min_length=1, max_length=64)
+    model_ref: str | None = Field(default=None, min_length=1, max_length=255)
     title: str | None = Field(default=None, max_length=255)
     active_run_id: UUID | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -37,6 +46,17 @@ class Conversation(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("Conversation timestamps must be timezone-aware")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_routing_binding(self) -> Conversation:
+        if self.routing_mode is ConversationRoutingMode.AUTO:
+            if self.agent_id != "task-router" or self.team_id is not None:
+                raise ValueError("auto Conversation must bind to task-router without a fixed Team")
+            if self.routing_policy_version is None:
+                raise ValueError("auto Conversation requires routing_policy_version")
+        elif self.routing_policy_version is not None:
+            raise ValueError("fixed Conversation cannot bind a RoutingPolicy version")
+        return self
 
 
 class ConversationMessage(BaseModel):

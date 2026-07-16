@@ -21,7 +21,13 @@ from agentcell.errors import (
 )
 from agentcell.events import ErrorPayload, EventType, GenericEventPayload, JsonValue
 from agentcell.policy import PolicyEngine
-from agentcell.tools.models import ToolCall, ToolExecutionContext, ToolHandlerOutput, ToolResult
+from agentcell.tools.models import (
+    ToolApprovalPreview,
+    ToolCall,
+    ToolExecutionContext,
+    ToolHandlerOutput,
+    ToolResult,
+)
 from agentcell.tools.registry import ToolRegistry
 
 _JSON_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
@@ -38,6 +44,22 @@ class ToolExecutor:
     ) -> None:
         self._registry = registry
         self._policy = policy or PolicyEngine()
+
+    async def preflight(
+        self,
+        call: ToolCall,
+        context: ToolExecutionContext,
+    ) -> ToolApprovalPreview | None:
+        """Validate schema, hard policy, and scoped arguments without accounting or effects."""
+
+        definition = self._registry.get(call.tool_name)
+        try:
+            params = definition.params_model.model_validate(call.arguments)
+        except ValidationError as error:
+            raise ToolArgumentsError(call.tool_name) from error
+        self._policy.authorize_capabilities(call.tool_name, definition.policy, context.lease)
+        preflight = definition.preflight or definition.approval_previewer
+        return None if preflight is None else await preflight(params, context)
 
     async def execute(
         self,
@@ -65,23 +87,15 @@ class ToolExecutor:
         change_completed = False
         try:
             definition = self._registry.get(call.tool_name)
-            try:
-                params = definition.params_model.model_validate(call.arguments)
-            except ValidationError as error:
-                raise ToolArgumentsError(call.tool_name) from error
-
-            self._policy.authorize_tool(
+            preview = await self.preflight(call, context)
+            params = definition.params_model.model_validate(call.arguments)
+            self._policy.require_approval(
                 call.tool_name,
                 definition.policy,
-                context.lease,
                 approval_granted=approval_granted,
+                preview=preview,
             )
             if approval_source is not None:
-                preview = (
-                    None
-                    if definition.approval_previewer is None
-                    else await definition.approval_previewer(params, context)
-                )
                 if context.approvals is not None:
                     await context.approvals.record(
                         call,

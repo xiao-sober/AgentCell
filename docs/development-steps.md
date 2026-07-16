@@ -722,7 +722,7 @@ CLI 已按持久化事件 sequence 流式展示公开文本、工具、审批、
 
 revision `20260714_0007` 已创建 `change_sets` 与 `file_changes`。workspace.write/patch/delete 在副作用前保存 before/after Artifact、SHA-256 和完整 Diff，副作用后重新校验并写入 `prepared/applied/completed/conflict` 状态；恢复路径会按当前哈希补全已应用记录或标记冲突。账本对单个 FileChange 和单个 Run 设置逻辑存储字节上限，超限在 Artifact 落盘和文件副作用前失败；反向变更使用同一额度并原子累计。可选 Git inspector 只执行受控只读 argv，保存 HEAD、分支、路径 dirty 状态和 path-scoped Diff；Git 不可用时仍由 Artifact 和哈希保证查询与恢复。CLI/API 已提供 changes list/show/diff/revert，回滚创建反向 FileChange，当前哈希或 Git HEAD 不匹配时拒绝覆盖。
 
-当前离线套件为 205 passed、6 个付费真实 Provider 测试按开关跳过，Ruff 与 Pyright 通过。阶段 9.2 的核心闭环已经完成，但真实 Provider 运行暴露出恢复身份、工具预检、UTF-8 分页和最终文本校验等正确性问题，因此先进入 9.2.1 收口，再进行 9.2.2 CLI 产品化和 9.3 确定性团队入口。ChangeSet/Artifact 清理、高级 Git 场景和独立回滚 Run 不再阻塞 CLI/Web 主链路，统一下沉到阶段 11。
+阶段 9.2 的核心闭环已经完成。真实 Provider 运行暴露出的恢复身份、工具预检、UTF-8 分页和最终文本校验问题已在 9.2.1 实现中收口；离线套件、静态检查和迁移门禁通过，6 个付费真实 Provider 测试仍按显式开关跳过。用户随后明确要求继续实现 9.2.2，因此 CLI 产品化在保留该线上发布门禁的前提下继续推进；ChangeSet/Artifact 清理、高级 Git 场景和独立回滚 Run 不阻塞 CLI/Web 主链路，统一下沉到阶段 11。
 
 ## 阶段 9.2.1：正确性收口与稳定基线
 
@@ -752,6 +752,22 @@ revision `20260714_0007` 已创建 `change_sets` 与 `file_changes`。workspace.
 - CLI/API 的失败终态可定位到稳定 Run，回滚权限由服务端推导；
 - 当前完整离线套件、Ruff、Pyright、迁移升降级和两家 Provider 的显式冒烟测试通过；
 - 将这一状态形成独立、可审查的稳定提交后，才进入 9.2.2。
+
+### 实现状态（2026-07-15）
+
+阶段 9.2.1 的代码与离线稳定基线已经落地：
+
+- revision `20260715_0008` 为 Run 增加版本化 `execution_identity`，保存 AgentSpec/ModelSpec 快照与哈希；Checkpoint 和分支继承该快照，审批决定、委派和模型执行前均先校验，缺少快照的旧 Run 以 `run_identity_mismatch` 安全失败；
+- ToolExecutor 已固定为 Schema → 能力授权 → 无副作用 preflight → Approval → ledger/budget → side effect。workspace、Shell、HTTP 和委派均在审批前完成各自边界检查，审批恢复还会重新 preflight 并核对新 Diff；
+- 只有模型可纠正的路径、命令或域名租约不匹配可触发一次全 Run 共享的 ModelRetry，重试计入模型请求预算但不会预留工具预算或写入批准事件，第二次明确失败；
+- CLI 审批支持 `a/t/m/r/q`、空输入 pending、修改参数与同工具临时授权；显式 Approval ID 必须同时提供决定且属于目标 Run。失败和取消输出稳定 Run/Conversation ID、状态与错误码，API Problem Details 同样可携带这些定位字段；
+- `workspace.read` 会将落在三字节中文或四字节 emoji continuation byte 的 requested offset 向合法字符起点对齐，并返回 requested/actual/next；真正非法 UTF-8 仍拒绝；
+- FinalOutputGuard 在最终回答窗口识别以 DSML、未解析 Function Call 或未完成工具意图为主体的输出，记录不含原文的 `model.output_rejected`。第一次以无工具方式预算内重试，第二次以 `invalid_final_output` 失败且不写 Conversation 最终消息；协议讲解、内联示例和 fenced 示例保持合法；
+- Artifact 压缩结果保留受限的工具名、call ID、类型、顶层键、原始字节数和最多 512 字节脱敏预览，没有增加任意 `artifact.load`；
+- 变更回滚请求不再接受客户端 CapabilityLease，服务端从 ChangeSet 工作区和原路径推导最小读写租约，并继续执行确认、当前哈希和 Git HEAD 保护；
+- 真实 Provider 测试已升级为完整 RunService 门禁，分别验证文本、公开流式事件、Function Calling、Usage、预算与终态。默认环境仍由付费开关保护，因此本次只验证了 6 项可正确收集并按设计跳过，没有声称线上调用通过。
+
+9.2.1 完成时离线验证结果为 `229 passed, 6 skipped`，Ruff、Ruff format、Pyright、`uv lock --check`、迁移升降级和 Alembic metadata check 均通过。6 个 skip 全部是未启用付费开关的 Qwen/DeepSeek 真实 Provider 门禁；该在线门禁尚未执行，并继续作为后续稳定发布前的外部验证项。
 
 ## 阶段 9.2.2：CLI 收敛与可读执行体验
 
@@ -854,6 +870,22 @@ TTY 目标效果：
 - 人类界面不出现 `source=model_request_reserved`、裸事件名或无解释参数字段；调试所需原始安全字段仅保留在 JSON/NDJSON；
 - 测试证明 ThinkingPart、`reasoning_content`、密钥、完整敏感参数和未脱敏工具输出不会进入 RunDisplayState 或 CLI Live 区。
 
+### 实现状态（2026-07-15）
+
+阶段 9.2.2 的代码与离线门禁已经落地：
+
+- `cli/app.py` 已拆出 `profile.py`、`approvals.py`、`display.py`、`changes.py` 和 `common.py`；Typer 主入口只负责命令参数、应用服务调用和稳定终态输出；
+- `CliRunProfile` 是 `run` 与 `chat` 的唯一 AgentSpec → CapabilityLease 解析边界。公开参数为 `--approval-mode`、`--write-scope`、`--command-profile`、`--command`、`--network-domain`；旧 `--permission-mode`、`--allow-write`、`--allow-command` 隐藏保留一个版本，人类输出提示弃用，JSON/NDJSON 不混入提示；
+- coder 默认写作用域为工作区根但没有命令；pytest/ruff/pyright profile 只加入同名 exact executable，不隐式批准 `python` 或 `uv`。write、shell、network 请求同时受 Agent capability 和实际工具上限校验，越权组合在创建 Run 前明确失败；
+- 普通 coordinator 改为 `max_children=0` 且默认 Lease 不再委派，9.2.2 没有意外接通自主多 Agent。Resume 不重新生成 profile，而是继续使用 9.2.1 Checkpoint 中的 Agent、模型、Lease、Budget 和 PermissionMode；
+- AgentRegistry 独立记录 `builtin/persisted/override` 来源和 `public/internal` 可见性。默认 CLI/API 列表隐藏 summarizer/finalizer，`agents list --all` 或 JSON 可查看；人类列表显示当前配置模型并明确使用 `configured=`，不冒充历史 Run 身份；
+- 顶层 `agentcell.display` 提供不依赖 Typer、Rich、FastAPI 的 RunDisplayState、RunDisplayProjector 和 ToolDisplayCatalog。它只消费排序后的安全领域事件，聚合重复工具活动、折叠阶段性文本、晋升最终候选、投影审批/Agent/预算，并可从重启后的同一持久化事件序列得到相同状态；
+- TTY 使用事件驱动、单实例、transient Rich Live 工作区与回答区；审批和终态先停止 Live，完成后只保留一次最终答案。非 TTY 只输出去重里程碑，预算事件不刷屏；`--no-stream`、JSON 和 NDJSON 契约保持独立；
+- AG-UI 文本与工具结果复用中立展示脱敏，`reasoning_content`、Thinking/Thought 键、常见 inline 凭据、完整工具参数和未脱敏工具输出不会进入 RunDisplayState 或 CLI Live；Conversation 继续结构化剥离 ThinkingPart；
+- 测试覆盖新旧 profile 等价、三种审批模式不改变 Lease、越权拒绝、命令 profile、run/chat、Agent 来源/可见性、候选回答、重复读取聚合、TTY/非 TTY、审批暂停、窄终端、秘密脱敏、AG-UI 和重启事件回放。
+
+9.2.2 主体没有新增数据库表。随后针对真实 Conversation 恢复暴露出的模型漂移与 v1 capability 哈希顺序问题完成正确性补丁：revision `20260715_0009` 为 Conversation 增加固定 `model_ref`，从历史执行身份回填；新 Run 身份使用确定性 capability 序列化，并兼容既有 v1 集合顺序。CLI/API 续聊只能使用绑定模型，显式切换以冲突失败。完成本节后的最新全量验证结果记录在 handoff；付费 Qwen/DeepSeek 六项真实 Provider 冒烟仍未在当前环境执行。
+
 ## 阶段 9.3：确定性多 Agent CLI
 
 ### 目标
@@ -884,6 +916,77 @@ uv run agentcell run --team software --model-ref deepseek_pro --approval-mode re
 - 不提供无限子 Agent、隐式自主委派或静默跨 Provider 降级；
 - 自主 `--collaborate` 作为后续可选产品能力，不阻塞阶段 10。
 
+阶段 9.3 已实现并根据真实 DeepSeek/Qwen 运行完成稳定性优化。新增不可变 `TeamSpec`、`TeamStageSpec` 和 `TeamRegistry`，应用只注册一个版本化 `software@v1` Team；`agentcell run --team software` 与显式 `--agent` 互斥，未传 Team 时仍使用原有 coordinator 单 Agent 默认值。CLI 先用 Coder 的 AgentSpec 上限建立 root Lease，再按阶段 capability 过滤为子租约；root Budget 的请求、工具、输入/输出/总 Token、时间和费用可使用独立权重分区，四个子预算都禁止继续委派。Team 默认 root 请求/工具预算为 24/48，请求分区调整为 6/9/6/3，工具硬上限调整为 3/27/6/0；阶段请求下限显式包含探索轮次和三次最终输出机会，root 少于 18 次请求时提前拒绝。未分配的工具额度保留在 root，不再让 Coordinator/Reviewer 的模型提示上限与实际硬额度矛盾。
+
+Handoff 根 Run 记录 Team 版本和 root Budget，每阶段创建真实子 Run，并保存实际 AgentSpec/ModelSpec 执行身份、父子委派、预算、职责、Lease、审批模式和检查点。Coordinator 明确停留在规划层；Coder 对保守识别出的纯测试修复任务先运行授权测试，`shell.test` 只有识别出真实 pytest 结果且确认非 collect-only、退出成功时，才会由运行时跨审批检查点关闭后续工具。Handoff 从持久化工具事件、Artifact 和 ChangeSet/FileChange 账本构造 Reviewer 证据；测试绿色且零变更时 Reviewer 不获得工作区工具。Reviewer 必须以 `PASS` 或 `CHANGES_NEEDED` 开头，Finalizer 始终无工具。FinalOutputGuard 的请求收尾窗口现在与三次最终输出尝试一致；底层模型在无工具窗口仍返回的无效工具协议不占用实际工具执行预算，由 AgentCell 在每次真实执行前继续实施硬上限。Provider 单响应的多工具批次若超过剩余额度，只执行预算内前缀，超额尾部记录失败并返回结构化未执行结果，随后无工具收尾，不再让 DeepSeek 的批量调用提前击穿 Coordinator。deferred 例外只覆盖恢复起点，审批后无论子成功或失败都会结算 root，并把完整结果 Usage 写回 `agent_delegations.accounted_usage`。目录/文件工具误用仍只允许一次无副作用纠正，安全拒绝不放宽。测试覆盖小阶段最终重试、批量工具尾部超额、collect-only 后继续真实测试、成功测试强制收尾、绿色零变更 Reviewer 无工具路径、审批重启、Usage 对账和既有四阶段恢复/失败/取消/回放。阶段 9.3 没有新增数据库结构，也没有开放自主 `--collaborate` 或 9.4 路由。
+
+## 阶段 9.4：统一任务入口与 Task Router
+
+### 目标
+
+让普通用户在 CLI 或 Web 中只提交自然语言任务，由统一后端服务选择只读分析、编码、审查、研究或确定性 software Team。用户不需要先理解 Agent、Team、Handoff 和租约参数；显式 Agent/Team 选择仍作为高级覆盖和自动化接口保留。
+
+目标交互：
+
+```powershell
+uv run agentcell run "检查项目并修复测试问题"
+uv run agentcell chat
+```
+
+模型、工作区、Agent/Team、权限和预算可以由配置提供默认值；需要覆盖时仍可显式传参。Web 使用同一 `TaskRoutingService`，主界面默认只有任务输入和路由预览，高级区域才显示 Agent/Team 覆盖、能力范围和预算。`run`/`chat` 保留为任务与会话的两个稳定入口，管理操作继续使用显式子命令。
+
+### 路由契约
+
+定义版本化 `TaskRouteRequest`、`TaskRouteDecision` 和 `TaskExecutionRequest`。路由决定至少包含：
+
+```text
+mode                  single_agent / team
+agent_id / team_id    实际候选
+confidence            0..1
+reason_summary        面向用户的安全简短依据
+required_capabilities 预计能力，不是已授权能力
+budget_profile        建议预算档位
+requires_confirmation 是否需要用户确认或补充信息
+```
+
+路由候选首版固定为：
+
+- 只读项目分析、解释和规划 → `coordinator`；
+- 明确代码修改与测试 → `coder`；
+- 独立审查、回归和安全检查 → `reviewer`；
+- 工作区与批准网络证据研究 → `researcher`；
+- 包含分析、修改、测试和独立审查的交付任务 → `software` Team。
+
+### 实施顺序
+
+1. 新增 transport-neutral `TaskRoutingService`，位于应用服务层，不依赖 Typer、FastAPI 或 React；
+2. 先用确定性规则识别明确的只读、修改、审查、研究和完整交付意图；只有规则无法确定时才调用低成本、结构化输出的路由模型；
+3. 对路由结果执行 Agent/Team 存在性、产品可见性、Workspace、Policy、Lease、Budget 和模型可用性校验；
+4. 路由只提出 `required_capabilities`，不能自动授予写入、Shell、网络或委派能力；缺少能力、低置信度或多个高风险候选时返回确认状态；
+5. 定义 `task.route_proposed`、`task.route_confirmed`、`task.route_overridden` 和 `task.route_rejected` 等版本化事件，保存安全依据、置信度和最终执行身份，不保存原始思维链；
+6. 实际任务先创建 root Run，再执行路由；路由模型请求、Token、费用和耗时计入 root Budget，所有决定关联该 Run。`--dry-route`/`POST /api/task-routes` 不创建 Run、不执行工具，但若使用模型回退必须明确有界 Token/费用且结果不作为权威审计记录；
+7. CLI 的 `run/chat` 默认调用 Task Router；`--agent`、`--team`、模型、Lease 和预算参数继续作为显式覆盖，覆盖结果同样记录事件；
+8. FastAPI 提供路由预览与任务创建接口，Web 只消费后端决定，不在前端通过关键词复制分类逻辑；
+9. 为 Conversation 定义 `fixed` 与 `auto` 路由模式：现有 Conversation 保持固定 Agent/Team 兼容；auto Conversation 保存版本化 RoutingPolicy，每个新 Run 可在允许的 public Agent/Team 中路由并保存实际身份，任何能力扩大仍需确认；
+10. auto Conversation 的历史投影按同一用户、项目、工作区和 RoutingPolicy 校验，不能因为切换 Agent 就继承上一 Run 的临时审批、Lease 或预算；
+11. 覆盖确定性路由、歧义确认、显式覆盖、权限不足、预算不足、未知 Agent/Team、Provider 不可用、fixed/auto Conversation 冲突和回放测试。
+
+### 完成门禁
+
+- 同一 TaskRouteRequest 在规则版本和 Registry 不变时得到可复现结果；模型回退使用结构化输出并有预算、超时和失败降级；
+- 路由器不能扩大 AgentSpec、CapabilityLease、命令、网络、预算或子 Agent 深度；
+- 低置信度和高风险能力差额不会静默启动执行；
+- CLI 与 Web/API 对同一请求使用同一 TaskRoutingService 和路由 DTO；
+- 显式 `--agent`/`--team` 仍可稳定覆盖，JSON 输出包含实际路由、覆盖来源和最终执行身份；
+- 管理命令不进入自然语言路由；
+- 路由事件、实际 root Run 和 child Run 可关联、回放和审计；
+- fixed Conversation 不会静默换 Agent/Team，auto Conversation 的每个 Run 都能追溯 RoutingPolicy、路由决定和实际执行身份；
+- 完成阶段 9.4 后，阶段 10 Web 才以统一输入框作为默认任务入口。
+
+阶段 9.4 已完成。`routing` 应用模块提供版本化 Request/Decision/Policy/Issue/ExecutionResult DTO；确定性规则覆盖只读分析、代码修改、独立审查、外部研究和完整 software 交付，歧义输入才调用有请求、Token、输出与超时上限的 PydanticAI 结构化分类。分类失败安全降级为待确认 Coordinator。`TaskRoutingService` 校验 public Agent/Team、目标能力、配置模型、Workspace、调用方 Lease 和 root Budget，能力差额不会扩权。权威路由先创建无 Agent 执行快照的 `task-router` root，再记录模型 Usage 与专用 `task.route_*` Payload；任务原文和原始思维链不写入路由事件。
+
+9.4.3 及收口切片复用既有 `checkpoints` 和 `agent_delegations`：待确认路由必须用原 decision hash 确认或拒绝，调用方可显式提供新 Lease，但服务会重新校验目标和全部 required capabilities，且不能修改 root Budget。确认后的 single-Agent route 创建一个直接 child；software Team 直接在同一 root 上运行四个阶段。`execute/resume/decide_approval` 支持跨进程继续，child Usage、审批暂停、取消、失败和完成均收敛到 root。CLI `run/chat`、`--dry-route`、`POST /api/task-routes`、`POST /api/tasks` 以及 task confirm/reject 已共用该服务。迁移 `20260716_0010` 增加 fixed/auto Conversation 绑定；auto 每轮保存实际路由身份并继承有界、配对安全的会话历史，但不继承临时审批、Lease 或预算。阶段 10 可以直接消费这些稳定 DTO 和 SSE 投影。
+
 ## 阶段 10：React Web 工作台
 
 ### 目标
@@ -896,14 +999,14 @@ uv run agentcell run --team software --model-ref deepseek_pro --approval-mode re
 2. 检查并优先复用 `src/components`、`src/components/ui`、`src/components/common`、`src/features` 和 Storybook；
 3. 建立稳定 DTO 与 API Client，服务端状态统一使用 TanStack Query；
 4. 实现 SSE 连接、按 sequence 恢复和断线状态反馈；
-5. 先实现会话列表、消息线程、连续追问输入、当前回合状态和 Conversation → Run 层级；
-6. 提供单 Agent 和 `software` Team 任务创建入口，只提交稳定 Agent/Team DTO，不在前端编排子 Agent；
+5. 先实现会话列表、消息线程、统一任务输入、路由预览、连续追问、当前回合状态和 Conversation → Run 层级；
+6. 默认使用阶段 9.4 Task Router，Agent/Team 选择器只作为高级覆盖；前端只提交稳定 Task/Route DTO，不自行分类或编排子 Agent；
 7. 实现统一审批、Diff/Change 查看与回滚确认、取消和恢复反馈；
 8. 用纵向时间线展示 root/child Run、Handoff 阶段、模型、状态、预算和租约摘要；首版不强制复杂节点编辑器；
 9. 使用 Badge、Progress、Timeline、Stepper 和异常行高亮表达状态；
 10. 安全渲染 Markdown、代码和 Diff，防止 XSS；
 11. 长列表使用分页或虚拟化，API Key 不进入 localStorage；
-12. 用 E2E 覆盖单 Agent、固定 Team、连续追问、审批、变更、取消、恢复和 SSE 断线续传。
+12. 用 E2E 覆盖自动路由、低置信度确认、显式覆盖、单 Agent、固定 Team、连续追问、审批、变更、取消、恢复和 SSE 断线续传。
 
 ### 视觉与交互验收
 
@@ -1001,16 +1104,25 @@ uv run agentcell run --team software --model-ref deepseek_pro --approval-mode re
 
 完成后才允许 Web 使用多 Agent；自主委派继续保持后端能力，不作为用户入口。
 
-### 迭代 4：阶段 10 Web MVP
+### 迭代 4：9.4 统一任务入口
+
+- TaskRoutingService 和版本化路由 DTO；
+- 确定性规则与低成本结构化模型回退；
+- 权限/预算差额确认和显式 Agent/Team 覆盖；
+- CLI/API 共用路由、事件和回放测试。
+
+完成后普通用户只需输入任务，系统能够安全选择单 Agent 或 software Team；管理命令仍保持显式。
+
+### 迭代 5：阶段 10 Web MVP
 
 - Conversation/Run 工作台；
 - SSE 续传；
 - 审批、变更、预算和固定 Team 时间线；
-- 单 Agent 与 software Team E2E。
+- 自动路由、单 Agent 与 software Team E2E。
 
 完成后先验证真实使用闭环，再进入阶段 10.1 管理页面，不同时铺开全部后台功能。
 
-### 迭代 5：10.1 管理补全与 11 发布加固
+### 迭代 6：10.1 管理补全与 11 发布加固
 
 - Agent、记忆、Provider、成本和审计管理；
 - OpenTelemetry、结构化日志和敏感信息检查；

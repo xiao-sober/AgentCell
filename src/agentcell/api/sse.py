@@ -75,7 +75,7 @@ async def stream_run_events(
                     continue
                 encoded = encoder.encode(agui_event)
                 yield f"id: {domain_event.sequence}.{offset}\n{encoded}"
-            terminal_seen = domain_event.event_type in _TERMINAL_EVENTS
+            terminal_seen = terminal_seen or domain_event.event_type in _TERMINAL_EVENTS
         if terminal_seen:
             return
         if await request.is_disconnected():

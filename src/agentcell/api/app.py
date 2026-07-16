@@ -20,6 +20,7 @@ from agentcell.api.routes import (
     provider_router,
     run_router,
     system_router,
+    task_router,
     tool_router,
 )
 from agentcell.application import AgentCellApplication, build_application
@@ -60,6 +61,7 @@ def create_app(application: AgentCellApplication | None = None) -> FastAPI:
         provider_router,
         tool_router,
         system_router,
+        task_router,
     ):
         app.include_router(router, prefix="/api")
     return app

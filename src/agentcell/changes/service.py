@@ -321,15 +321,25 @@ class ChangeService:
         self,
         change_id: UUID,
         *,
-        workspace: Path,
-        lease: CapabilityLease,
         events: ToolEventSink,
     ) -> FileChange:
-        """Create and apply a new reverse FileChange after an external human decision."""
+        """Reverse one change using only its server-owned workspace and exact path lease."""
 
         original = await self.get(change_id)
         if original.status is not FileChangeStatus.COMPLETED or original.reverted_by_change_id:
             raise ChangeConflictError(original.path)
+        async with self._database.session() as session:
+            change_set = await ChangeSetRepository(session).get(original.change_set_id)
+        if change_set is None:
+            raise RuntimeError("FileChange references a missing ChangeSet")
+        workspace = await asyncio.to_thread(
+            Path(change_set.workspace).resolve,
+            strict=True,
+        )
+        lease = CapabilityLease(
+            filesystem_read=(original.path,),
+            filesystem_write=(original.path,),
+        )
         current = await self._current_bytes(workspace, original.path, lease)
         if _sha256(current) != original.after_sha256:
             raise ChangeConflictError(original.path)
@@ -351,10 +361,6 @@ class ChangeService:
             raise ArtifactTooLargeError(
                 f"FileChange requires {storage_bytes} bytes; limit is {self._max_file_change_bytes}"
             )
-        async with self._database.session() as session:
-            change_set = await ChangeSetRepository(session).get(original.change_set_id)
-        if change_set is None:
-            raise RuntimeError("FileChange references a missing ChangeSet")
         if change_set.storage_bytes + storage_bytes > self._max_run_change_bytes:
             raise ArtifactTooLargeError(
                 f"ChangeSet requires {change_set.storage_bytes + storage_bytes} bytes; "

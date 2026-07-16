@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +32,8 @@ from agentcell.errors import (
     ProviderUpstreamError,
     RunAlreadyExistsError,
     RunNotFoundError,
+    TeamNotFoundError,
+    TeamRegistrationError,
     ToolNotFoundError,
 )
 
@@ -40,12 +44,15 @@ def install_error_handlers(app: FastAPI) -> None:
         request: Request, error: AgentCellError
     ) -> JSONResponse:
         status = _status_for(error)
+        raw_context = cast(object, getattr(request.state, "run_context", None))
+        context = cast(dict[str, object], raw_context) if isinstance(raw_context, dict) else None
         return _problem(
             request,
             status=status,
             code=error.code,
             detail=str(error),
             retryable=error.retryable,
+            extra=context,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -53,12 +60,20 @@ def install_error_handlers(app: FastAPI) -> None:
         request: Request,
         error: RequestValidationError,
     ) -> JSONResponse:
+        identifiers: dict[str, object] = {}
+        body = cast(object, error.body)
+        if isinstance(body, dict):
+            mapping = cast(dict[object, object], body)
+            for key in ("run_id", "conversation_id"):
+                value = mapping.get(key)
+                if isinstance(value, str):
+                    identifiers[key] = value
         return _problem(
             request,
             status=422,
             code="request_validation_error",
             detail="Request validation failed",
-            extra={"errors": jsonable_encoder(error.errors())},
+            extra={"errors": jsonable_encoder(error.errors()), **identifiers},
         )
 
 
@@ -72,6 +87,7 @@ def _status_for(error: AgentCellError) -> int:
             DelegationNotFoundError,
             MemoryNotFoundError,
             AgentNotFoundError,
+            TeamNotFoundError,
             ToolNotFoundError,
         ),
     ):
@@ -83,6 +99,7 @@ def _status_for(error: AgentCellError) -> int:
             ApprovalConflictError,
             ConversationConflictError,
             RunAlreadyExistsError,
+            TeamRegistrationError,
         ),
     ):
         return 409

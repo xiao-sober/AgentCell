@@ -89,6 +89,7 @@ class ReplayService:
         child = Run(
             conversation_id=source.conversation_id,
             agent_id=source.agent_id,
+            execution_identity=source.execution_identity,
             parent_run_id=source.id,
         )
         running = child.transition_to(RunStatus.RUNNING)
@@ -103,6 +104,11 @@ class ReplayService:
                 payload=RunStartedPayload(
                     conversation_id=child.conversation_id,
                     agent_id=child.agent_id,
+                    **(
+                        {}
+                        if child.execution_identity is None
+                        else child.execution_identity.event_fields()
+                    ),
                 ),
             )
             await runs.save(running)
@@ -132,6 +138,7 @@ class ReplayService:
                 event_sequence=checkpoint_event.sequence,
                 kind=CheckpointKind.BRANCH,
                 agent_id=source_checkpoint.agent_id,
+                execution_identity=source_checkpoint.execution_identity,
                 prompt=source_checkpoint.prompt,
                 workspace=source_checkpoint.workspace,
                 lease=source_checkpoint.lease,

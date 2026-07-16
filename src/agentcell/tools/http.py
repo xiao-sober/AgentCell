@@ -15,13 +15,14 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentcell.errors import (
+    HttpDomainLeaseMismatchError,
     HttpRequestDeniedError,
     HttpResponseTooLargeError,
     HttpToolError,
 )
 from agentcell.events import JsonValue
 from agentcell.policy import Capability, RiskLevel, ToolPolicy
-from agentcell.tools.models import ToolDefinition, ToolExecutionContext
+from agentcell.tools.models import ToolApprovalPreview, ToolDefinition, ToolExecutionContext
 from agentcell.tools.registry import ToolRegistry
 
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"})
@@ -199,6 +200,23 @@ class HttpRequestHandler:
                 finally:
                     await response.aclose()
 
+    async def preflight(
+        self,
+        params: HttpRequestParams,
+        context: ToolExecutionContext,
+    ) -> ToolApprovalPreview:
+        """Validate the initial destination and body without sending a request."""
+
+        _request_content(params)
+        current = httpx.URL(params.url)
+        original_host, _pinned_url, _addresses = await self._validate_and_pin(
+            current,
+            context.lease.network_domains,
+        )
+        return ToolApprovalPreview(
+            impact=f"Send {params.method} request to https://{original_host}"
+        )
+
     async def _validate_and_pin(
         self,
         url: httpx.URL,
@@ -216,7 +234,7 @@ class HttpRequestHandler:
         if parsed.port not in {None, 443}:
             raise HttpRequestDeniedError("only HTTPS port 443 is allowed")
         if not any(host == domain or host.endswith(f".{domain}") for domain in allowed_domains):
-            raise HttpRequestDeniedError("host is outside the network lease")
+            raise HttpDomainLeaseMismatchError("host is outside the network lease")
         if any(name.casefold() in _SENSITIVE_QUERY_NAMES for name, _ in parse_qsl(parsed.query)):
             raise HttpRequestDeniedError("sensitive query parameters are forbidden")
         try:
@@ -326,6 +344,7 @@ def register_http_tools(
 ) -> None:
     """Register a conservative request tool; every method requires per-Run approval."""
 
+    handler = HttpRequestHandler(resolver=resolver, transport=transport)
     registry.register(
         ToolDefinition(
             name="http.request",
@@ -341,6 +360,7 @@ def register_http_tools(
                 max_output_bytes=64 * 1024,
                 capabilities=frozenset({Capability.NETWORK_REQUEST}),
             ),
-            handler=HttpRequestHandler(resolver=resolver, transport=transport),
+            handler=handler,
+            preflight=handler.preflight,
         )
     )

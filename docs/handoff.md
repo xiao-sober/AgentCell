@@ -2,9 +2,9 @@
 
 ## 1. 当前状态
 
-更新时间：2026-07-14
+更新时间：2026-07-15
 
-项目已经完成“阶段 9.2：CLI Agent、权限与流式执行闭环”的核心实现。当前具备 `run/chat --agent coder`、显式写路径和命令租约、request/auto/full 权限模式、完整 Diff 审批、按持久化事件 sequence 去重的 Rich 实时输出、`run --json-events` NDJSON 机器流、每轮 Run/Conversation 标识、退出续聊提示，以及带单文件/单 Run 存储额度的 ChangeSet/FileChange、before/after Artifact、Git 辅助元数据和哈希保护的显式反向变更。后续路线已经拆分为 9.2.1 正确性收口、9.2.2 CLI 产品化、9.3 确定性 software Team、10 Web MVP 和 10.1 管理补全；存储清理、高级 Git、Shell 副作用检测和独立回滚 Run 下沉到阶段 11。
+项目已经完成阶段 9.2、9.2.1、9.2.2、9.3 和 9.4。版本化 `software@v1` Team 确定性执行四个持久化子 Run；统一 Task Router 现在为 CLI/API/auto Conversation 提供规则优先、结构化模型回退和权威 root。根据 DeepSeek/Qwen 真实失败样本，Team 默认 root 请求/工具预算保持 24/48，阶段请求分区为 6/9/6/3，工具硬上限为 3/27/6/0。下一开发阶段是阶段 10 Web MVP 和 10.1 管理补全；付费真实 Provider 回归仍需在密钥环境显式执行。
 
 ## 2. 本轮已完成
 
@@ -247,6 +247,7 @@ G:\AgentCell
 │   └── tool-security.md
 ├── src/agentcell/
 │   ├── config.py
+│   ├── display.py
 │   ├── errors.py
 │   ├── agents/
 │   │   └── delegation.py
@@ -254,6 +255,12 @@ G:\AgentCell
 │   ├── budgets/models.py
 │   ├── budgets/tracker.py
 │   ├── cli/
+│   │   ├── app.py
+│   │   ├── approvals.py
+│   │   ├── changes.py
+│   │   ├── common.py
+│   │   ├── display.py
+│   │   └── profile.py
 │   ├── events/models.py
 │   ├── kernel/lifecycle.py
 │   ├── kernel/models.py
@@ -293,7 +300,9 @@ G:\AgentCell
 │       ├── 20260713_0004_add_agent_delegations.py
 │       ├── 20260713_0005_add_agents.py
 │       ├── 20260714_0006_add_conversations.py
-│       └── 20260714_0007_add_file_changes.py
+│       ├── 20260714_0007_add_file_changes.py
+│       ├── 20260715_0008_add_run_execution_identity.py
+│       └── 20260715_0009_bind_conversation_model.py
 └── web/src/
     ├── api/
     ├── components/
@@ -304,9 +313,9 @@ G:\AgentCell
 
 ## 6. 下一位开发者的建议入口
 
-先执行阶段 9.2.1 正确性收口：固定审批恢复的 Agent/模型身份，在审批前完成 Tool preflight 和一次有界参数纠正，修正审批热键与 pending 恢复，修复 Qwen 中文 UTF-8 offset 误判，增加窄范围 FinalOutputGuard 阻止 DeepSeek DSML/伪工具协议成为 completed 结果，确保失败终态仍返回稳定 Run/Conversation ID，并把回滚 Lease 改为服务端推导。优先改善 Artifact 有界摘要，只有测试证明需要时才增加受引用范围约束的 `artifact.load`。完成迁移、离线套件、Ruff、Pyright 和两家真实 Provider 冒烟测试后形成独立稳定提交。
+阶段 9.2.1、9.2.2、9.3 与 9.4 的代码和离线基线已经完成；Qwen/DeepSeek 的显式 software Team 完整流程也已由用户实机验证。若后续线上失败，只修复公共协议或数据形态问题，不在 Kernel/Tool/FinalOutputGuard 中增加厂商名称分支。
 
-随后执行阶段 9.2.2：拆分过大的 CLI 模块，建立统一 CliRunProfile，收敛参数兼容层，为 AgentRegistry 增加来源与 public/internal 可见性，并实现 transport-neutral RunDisplayProjector 与 Rich Live 双区视图。再进入阶段 9.3，只接通显式 `--team software` 程序化 Handoff；自主 `--collaborate` 不阻塞 Web。阶段 10 先交付 Conversation/Run/审批/变更/预算工作台，阶段 10.1 再补 Agent、记忆、Provider 和成本管理页面。Artifact 引用清理、高级 Git、Shell 副作用检测和独立回滚 Run 统一在阶段 11 完成。
+阶段 9.4 已完成 CLI/Web 可复用的 TaskRoutingService、规则优先/有界结构化模型回退、任务 root、专用路由事件和不可扩权校验，并在既有 root 上完成 decision-hash 确认、single-Agent/software-Team child 执行、审批与跨进程恢复、root Usage 和终态收口。CLI `run/chat`、API preview/task 以及 fixed/auto Conversation 已接入同一服务。自主 `--collaborate` 不阻塞 Web。阶段 10 先交付统一输入、路由预览、Conversation/Run/审批/变更/预算工作台，阶段 10.1 再补 Agent、记忆、Provider 和成本管理页面。
 
 ## 7. 环境与命令
 
@@ -326,6 +335,8 @@ pnpm 9.15.9
 uv sync --python 3.12 --dev
 uv run alembic upgrade head
 uv run agentcell run --offline-fake "分析当前项目"
+uv run agentcell run --offline-fake --agent coder --write-scope . --command-profile pytest "修复测试失败"
+uv run agentcell run --offline-fake --team software --approval-mode request "修复并独立审查"
 uv run agentcell run --offline-fake --json "分析当前项目"
 uv run agentcell replay <run-id>
 uv run agentcell branch <run-id> --from-sequence 18
@@ -345,16 +356,16 @@ Web 尚未初始化，不应运行 `pnpm install` 或假设已有前端脚本。
 在 uv 管理的 Python 3.12.11 环境中执行：
 
 ```text
-uv run python -m pytest -q    195 passed, 6 skipped（真实 Provider，当前进程未启用付费开关）
+uv run python -m pytest -q    304 passed, 6 skipped（真实 Provider，当前进程未启用付费开关）
 uv run ruff check .           passed
 uv run ruff format --check .  passed
 uv run pyright                0 errors, 0 warnings
-uv run alembic upgrade head   passed, 20260713_0005 (head，隔离临时数据库)
+uv run alembic upgrade head   passed, 20260715_0009 (head，隔离临时数据库)
 uv run alembic check          no new upgrade operations detected
 uv lock --check               passed
 ```
 
-本轮已运行完整后端测试，并重点覆盖 Conversation 历史继承、跨进程续聊、作用域隔离、并发冲突、FastAPI、AG-UI/SSE、CLI、审批恢复和多 Agent 回归。默认迁移头为 `20260714_0006`，在隔离临时数据库完成 upgrade、downgrade 与 Alembic check，无 metadata 漂移；未改动工作区现有 `.agentcell` 数据库。当前进程未启用付费 Provider 开关，因此六项真实 Provider 测试按设计跳过且没有产生线上调用。前端测试未运行，因为尚无应用实现。
+本轮完整后端门禁覆盖执行身份、审批恢复、最终输出防护、software Team、版本化路由 DTO、决策哈希、确定性规则、有界模型回退、能力差额、public Registry/Provider/Budget 校验、权威 task root、路由事件、CLI/API 默认入口、fixed/auto Conversation、single-Agent/software-Team child、root Usage、审批重启和终态恢复。默认迁移头为 `20260716_0010`；隔离临时数据库的 Alembic 和锁文件门禁通过，未改动工作区现有 `.agentcell` 数据库。当前验证未启用付费 Provider 测试开关，因此真实 Provider Contract 测试按设计跳过且本轮没有产生线上调用。前端测试未运行，因为尚无应用实现。
 
 ## 9. 交接时必须更新的内容
 

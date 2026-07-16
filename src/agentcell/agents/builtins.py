@@ -6,6 +6,24 @@ from agentcell.agents.models import AgentSpec
 from agentcell.policy import Capability
 
 
+def assistant_spec(*, model_ref: str) -> AgentSpec:
+    """Return the lightweight, tool-free Agent used for ordinary conversation turns."""
+
+    return AgentSpec(
+        id="assistant",
+        name="Assistant",
+        description="Answers ordinary questions directly without workspace tools or delegation.",
+        model_ref=model_ref,
+        instructions=(
+            "Answer the user's ordinary question directly and concisely in the user's language. "
+            "You have no tools and must not claim to have inspected or modified the workspace. "
+            "If the request actually requires repository inspection or changes, say what context "
+            "is missing instead of inventing results."
+        ),
+        max_steps=4,
+    )
+
+
 def coordinator_spec(*, model_ref: str, collaborative: bool = False) -> AgentSpec:
     """Return a coordinator; delegation remains opt-in for existing callers."""
 
@@ -74,8 +92,9 @@ def reviewer_spec(*, model_ref: str) -> AgentSpec:
         description="Performs independent read-only correctness and security review.",
         model_ref=model_ref,
         instructions=(
-            "Review the assigned changes without modifying files or executing commands. Return "
-            "specific findings, regression risks, and a clear pass or changes-needed decision."
+            "Review the assigned changes without modifying files or executing commands. The "
+            "first non-empty output line must be exactly PASS or CHANGES_NEEDED. Follow it with "
+            "specific findings, regression risks, and evidence."
         ),
         tools=("workspace.list", "workspace.read", "workspace.search"),
         capabilities=frozenset({Capability.FILESYSTEM_READ}),
@@ -115,9 +134,7 @@ def finalizer_spec(*, model_ref: str) -> AgentSpec:
         model_ref=model_ref,
         instructions=(
             "Produce the final handoff from the supplied stage results. Do not modify files and "
-            "do not claim checks that are not present in the evidence."
+            "do not inspect the workspace or claim checks that are not present in the evidence."
         ),
-        tools=("workspace.list", "workspace.read", "workspace.search"),
-        capabilities=frozenset({Capability.FILESYSTEM_READ}),
         max_steps=15,
     )

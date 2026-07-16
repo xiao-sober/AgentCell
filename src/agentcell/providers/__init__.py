@@ -15,6 +15,7 @@ from agentcell.providers.fake import (
     FakeProviderAdapter,
     FakeScript,
     FakeTextStep,
+    FakeToolCallsStep,
     FakeToolCallStep,
 )
 from agentcell.providers.models import (
@@ -45,6 +46,7 @@ __all__ = [
     "FakeScript",
     "FakeTextStep",
     "FakeToolCallStep",
+    "FakeToolCallsStep",
     "HttpClientSpec",
     "ModelCompleted",
     "ModelOutputEvent",

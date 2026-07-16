@@ -12,6 +12,9 @@ NonNegativeInt = Annotated[int, Field(ge=0, strict=True)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 
+# One initial final response plus two bounded validation retries.
+FINAL_OUTPUT_ATTEMPTS = 3
+
 
 class Budget(BaseModel):
     """Hard resource ceilings assigned to one Run."""

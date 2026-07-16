@@ -21,6 +21,7 @@ from agentcell.api.sse import StreamCursor, stream_run_events
 from agentcell.errors import ApprovalConflictError, RunNotFoundError
 from agentcell.kernel.run_service import RunRequest
 from agentcell.policy import Approval, ApprovalStatus
+from agentcell.routing import TASK_ROUTER_AGENT_ID
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 approval_router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -78,13 +79,34 @@ async def cancel_run(run_id: UUID, application: ApplicationDependency) -> RunRes
 async def resume_run(
     run_id: UUID,
     body: ResumeRunRequest,
+    request: Request,
     application: ApplicationDependency,
 ) -> RunResponse:
     run = await application.get_run(run_id)
     if run is None:
         raise RunNotFoundError(str(run_id))
+    request.state.run_context = {
+        "run_id": str(run.id),
+        "conversation_id": str(run.conversation_id),
+        "run_status": run.status.value,
+    }
     if run.status.is_terminal:
         raise ApprovalConflictError("Terminal Run cannot be resumed")
+    if run.agent_id == TASK_ROUTER_AGENT_ID:
+        if body.approval_id is None:
+            if body.decision is not None:
+                raise ApprovalConflictError("decision requires approval_id")
+            routed = await application.routing.resume(run_id)
+        else:
+            if body.decision is None:
+                raise ApprovalConflictError("approval_id requires decision")
+            routed = await application.routing.decide_approval(
+                run_id,
+                body.approval_id,
+                body.decision,
+            )
+        await application.conversations.record_task_result(routed)
+        return RunResponse.from_domain(routed.run)
     if body.approval_id is None:
         if body.decision is not None:
             raise ApprovalConflictError("decision requires approval_id")
@@ -128,9 +150,8 @@ async def decide_approval(
     body: ApprovalDecisionRequest,
     application: ApplicationDependency,
 ) -> RunResponse:
-    result = await application.runs.resume(approval_id, body.decision)
-    await application.conversations.record_if_managed(result)
-    return RunResponse.from_domain(result.run)
+    run = await application.decide_approval(approval_id, body.decision)
+    return RunResponse.from_domain(run)
 
 
 def _approval_response(approval: Approval) -> ApprovalResponse:

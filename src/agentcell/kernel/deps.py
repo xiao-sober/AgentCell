@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
 from agentcell.agents import AgentRegistry
 from agentcell.budgets import BudgetTracker
+from agentcell.kernel.final_output import FinalOutputState
 from agentcell.memory.service import MemoryService
 from agentcell.policy import CapabilityLease, PermissionMode
 from agentcell.tools import (
@@ -20,6 +21,19 @@ from agentcell.tools import (
     ToolExecutionLedger,
     ToolExecutor,
 )
+
+
+@dataclass(slots=True)
+class ToolRetryState:
+    """Allow one model correction for a safe, side-effect-free tool mistake."""
+
+    used: bool = False
+
+    def consume(self) -> bool:
+        if self.used:
+            return False
+        self.used = True
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +62,10 @@ class RunDeps:
     memory: MemoryService | None = None
     depth: int = 0
     delegation: AgentDelegationExecutor | None = None
-    has_deferred_tool_results: bool = False
+    finalize_after_successful_test: bool = False
+    deferred_tool_results_at_request: int | None = None
+    tool_retries: ToolRetryState = field(default_factory=ToolRetryState)
+    final_output: FinalOutputState = field(default_factory=FinalOutputState)
 
     def tool_context(self, *, provider_call_id: str | None = None) -> ToolExecutionContext:
         return ToolExecutionContext(

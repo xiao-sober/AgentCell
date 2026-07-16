@@ -20,6 +20,7 @@ from agentcell.conversations.models import (
     Conversation,
     ConversationMessage,
     ConversationMessageKind,
+    ConversationRoutingMode,
 )
 from agentcell.errors import (
     AgentRegistrationError,
@@ -28,6 +29,7 @@ from agentcell.errors import (
     CheckpointNotFoundError,
     ConfigurationError,
     ConversationConflictError,
+    ConversationModelBindingError,
     ConversationNotFoundError,
     DelegationNotFoundError,
     EventPayloadTooLargeError,
@@ -48,7 +50,7 @@ from agentcell.events import (
     parse_event_payload,
     payload_model_for,
 )
-from agentcell.kernel.checkpoint import Checkpoint
+from agentcell.kernel.checkpoint import Checkpoint, CheckpointKind
 from agentcell.kernel.models import Run
 from agentcell.memory.models import MemoryItem, MemoryKind, MemoryScope
 from agentcell.policy import Approval, ApprovalStatus
@@ -132,6 +134,11 @@ class RunRepository:
             id=run.id,
             conversation_id=run.conversation_id,
             agent_id=run.agent_id,
+            execution_identity=(
+                None
+                if run.execution_identity is None
+                else run.execution_identity.model_dump(mode="json")
+            ),
             parent_run_id=run.parent_run_id,
             status=run.status.value,
             created_at=run.created_at,
@@ -163,6 +170,11 @@ class RunRepository:
             .values(
                 conversation_id=run.conversation_id,
                 agent_id=run.agent_id,
+                execution_identity=(
+                    None
+                    if run.execution_identity is None
+                    else run.execution_identity.model_dump(mode="json")
+                ),
                 parent_run_id=run.parent_run_id,
                 status=run.status.value,
                 created_at=run.created_at,
@@ -185,6 +197,7 @@ class RunRepository:
                 "id": row.id,
                 "conversation_id": row.conversation_id,
                 "agent_id": row.agent_id,
+                "execution_identity": row.execution_identity,
                 "parent_run_id": row.parent_run_id,
                 "status": row.status,
                 "created_at": row.created_at,
@@ -207,6 +220,10 @@ class ConversationRepository:
                 project_id=conversation.project_id,
                 workspace=conversation.workspace,
                 agent_id=conversation.agent_id,
+                routing_mode=conversation.routing_mode.value,
+                team_id=conversation.team_id,
+                routing_policy_version=conversation.routing_policy_version,
+                model_ref=conversation.model_ref,
                 title=conversation.title,
                 active_run_id=conversation.active_run_id,
                 next_message_sequence=1,
@@ -286,6 +303,25 @@ class ConversationRepository:
             .values(active_run_id=None, updated_at=datetime.now(UTC))
         )
 
+    async def bind_model(self, conversation_id: UUID, model_ref: str) -> Conversation:
+        """Bind one legacy Conversation exactly once without allowing model drift."""
+
+        await self._session.execute(
+            update(ConversationRow)
+            .where(
+                ConversationRow.id == conversation_id,
+                ConversationRow.model_ref.is_(None),
+            )
+            .values(model_ref=model_ref, updated_at=datetime.now(UTC))
+        )
+        conversation = await self.get_required(conversation_id)
+        if conversation.model_ref != model_ref:
+            raise ConversationModelBindingError(
+                f"Conversation {conversation_id} is bound to model "
+                f"{conversation.model_ref!r}, not {model_ref!r}"
+            )
+        return conversation
+
     @staticmethod
     def _to_domain(row: ConversationRow) -> Conversation:
         return Conversation(
@@ -294,6 +330,10 @@ class ConversationRepository:
             project_id=row.project_id,
             workspace=row.workspace,
             agent_id=row.agent_id,
+            routing_mode=ConversationRoutingMode(row.routing_mode),
+            team_id=row.team_id,
+            routing_policy_version=row.routing_policy_version,
+            model_ref=row.model_ref,
             title=row.title,
             active_run_id=row.active_run_id,
             created_at=row.created_at,
@@ -649,6 +689,24 @@ class CheckpointRepository:
         if row is None:
             raise CheckpointNotFoundError(str(run_id))
         return Checkpoint.model_validate(row.data)
+
+    async def latest_by_kind(
+        self,
+        run_id: UUID,
+        kind: CheckpointKind,
+    ) -> Checkpoint:
+        """Return the latest checkpoint of one workflow kind for a Run."""
+
+        rows = await self._session.scalars(
+            select(CheckpointRow)
+            .where(CheckpointRow.run_id == run_id)
+            .order_by(CheckpointRow.event_sequence.desc())
+        )
+        for row in rows:
+            checkpoint = Checkpoint.model_validate(row.data)
+            if checkpoint.kind is kind:
+                return checkpoint
+        raise CheckpointNotFoundError(f"{run_id}:{kind.value}")
 
 
 class SqliteToolExecutionLedger:

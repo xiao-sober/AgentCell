@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Protocol
+from typing import Protocol, cast
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -17,7 +18,14 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
-from agentcell.events import ArtifactReference, EventPayload, EventType, GenericEventPayload
+from agentcell.events import (
+    ArtifactReference,
+    EventPayload,
+    EventType,
+    GenericEventPayload,
+    JsonValue,
+    redact_sensitive_data,
+)
 from agentcell.memory.models import MemoryScope
 
 
@@ -217,15 +225,65 @@ class ToolOutputCompactor:
                     replace(
                         part,
                         content={
-                            "summary": (
-                                f"Tool output moved to Artifact ({reference.size_bytes} bytes)."
-                            ),
+                            "summary": "Oversized tool output was compacted into an Artifact.",
+                            **_artifact_summary(part, encoded),
                             "artifact": reference.model_dump(mode="json"),
                         },
                     )
                 )
             compacted.append(replace(message, parts=parts))
         return compacted
+
+
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)"
+    r"\s*[:=]\s*([^\s,;\]}]+)"
+)
+
+
+def _artifact_summary(part: ToolReturnPart, encoded: bytes) -> dict[str, JsonValue]:
+    normalized = cast(JsonValue, json.loads(encoded))
+    safe = redact_sensitive_data(normalized)
+    safe_text = json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+    safe_text = _SENSITIVE_TEXT.sub(r"\1=[REDACTED]", safe_text)
+    top_level_keys: list[JsonValue] = (
+        list(sorted(str(key) for key in safe)[:12]) if isinstance(safe, dict) else []
+    )
+    return {
+        "tool_name": part.tool_name,
+        "tool_call_id": part.tool_call_id,
+        "content_type": _json_type(safe),
+        "top_level_keys": top_level_keys,
+        "original_bytes": len(encoded),
+        "preview": _bounded_utf8(safe_text, 512),
+    }
+
+
+def _json_type(value: JsonValue) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return "number"
+
+
+def _bounded_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    candidate = encoded[:max_bytes]
+    while candidate:
+        try:
+            return candidate.decode("utf-8") + "…"
+        except UnicodeDecodeError:
+            candidate = candidate[:-1]
+    return "…"
 
 
 class ContextManager:

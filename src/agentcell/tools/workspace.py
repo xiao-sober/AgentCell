@@ -11,7 +11,7 @@ import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agentcell.errors import (
     ConfigurationError,
     WorkspaceBinaryFileError,
+    WorkspaceLeaseMismatchError,
     WorkspacePatchConflictError,
     WorkspacePathDeniedError,
     WorkspacePathError,
@@ -58,7 +59,12 @@ class WorkspaceListParams(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    path: str = Field(default=".", min_length=1, max_length=1024)
+    path: str = Field(
+        default=".",
+        min_length=1,
+        max_length=1024,
+        description="Relative directory path; use workspace.read for a file.",
+    )
     include_hidden: bool = False
     max_entries: int = Field(default=200, ge=1, le=500, strict=True)
 
@@ -89,7 +95,11 @@ class WorkspaceReadParams(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    path: str = Field(min_length=1, max_length=1024)
+    path: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="Relative UTF-8 file path; use workspace.list for a directory.",
+    )
     offset_bytes: int = Field(default=0, ge=0, strict=True)
     max_bytes: int = Field(default=64 * 1024, ge=4, le=64 * 1024, strict=True)
 
@@ -101,6 +111,8 @@ class WorkspaceReadResult(BaseModel):
 
     path: str
     content: str
+    requested_offset_bytes: int = Field(ge=0)
+    actual_offset_bytes: int = Field(ge=0)
     offset_bytes: int
     bytes_read: int = Field(ge=0)
     total_bytes: int = Field(ge=0)
@@ -318,7 +330,7 @@ class WorkspacePathResolver:
         workspace_relative = _relative_to(resolved, self.root)
         _ensure_not_sensitive(workspace_relative.parts)
         if not any(self._within_scope(resolved, scope) for scope in allowed_scopes):
-            raise WorkspacePathDeniedError("path is outside the filesystem_read lease")
+            raise WorkspaceLeaseMismatchError("path is outside the filesystem_read lease")
         if expected == "file" and not resolved.is_file():
             raise WorkspacePathTypeError(requested, "file")
         if expected == "directory" and not resolved.is_dir():
@@ -336,7 +348,7 @@ class WorkspacePathResolver:
         lease_name: str,
     ) -> None:
         if not any(self._within_scope(path, scope) for scope in allowed_scopes):
-            raise WorkspacePathDeniedError(f"path is outside the {lease_name} lease")
+            raise WorkspaceLeaseMismatchError(f"path is outside the {lease_name} lease")
 
     def resolve_write(
         self,
@@ -374,7 +386,7 @@ class WorkspacePathResolver:
             raise WorkspacePathDeniedError("write path could not be resolved safely") from error
         _relative_to(resolved, self.root)
         if not any(self._within_scope(resolved, scope) for scope in allowed_scopes):
-            raise WorkspacePathDeniedError("path is outside the filesystem_write lease")
+            raise WorkspaceLeaseMismatchError("path is outside the filesystem_write lease")
         return resolved
 
     def _ensure_existing_components_are_plain(self, relative: Path) -> None:
@@ -437,6 +449,44 @@ async def workspace_search(
         allowed_scopes=context.lease.filesystem_read,
     )
     return await asyncio.to_thread(_search_text, search_root, resolver, params)
+
+
+async def preflight_workspace_list(
+    params: WorkspaceListParams,
+    context: ToolExecutionContext,
+) -> ToolApprovalPreview:
+    resolver = WorkspacePathResolver(context.workspace)
+    directory = resolver.resolve_read(
+        params.path,
+        allowed_scopes=context.lease.filesystem_read,
+        expected="directory",
+    )
+    return ToolApprovalPreview(impact=f"List {resolver.relative_name(directory)}")
+
+
+async def preflight_workspace_read(
+    params: WorkspaceReadParams,
+    context: ToolExecutionContext,
+) -> ToolApprovalPreview:
+    resolver = WorkspacePathResolver(context.workspace)
+    file_path = resolver.resolve_read(
+        params.path,
+        allowed_scopes=context.lease.filesystem_read,
+        expected="file",
+    )
+    return ToolApprovalPreview(impact=f"Read {resolver.relative_name(file_path)}")
+
+
+async def preflight_workspace_search(
+    params: WorkspaceSearchParams,
+    context: ToolExecutionContext,
+) -> ToolApprovalPreview:
+    resolver = WorkspacePathResolver(context.workspace)
+    search_root = resolver.resolve_read(
+        params.path,
+        allowed_scopes=context.lease.filesystem_read,
+    )
+    return ToolApprovalPreview(impact=f"Search {resolver.relative_name(search_root)}")
 
 
 async def workspace_write(
@@ -588,19 +638,27 @@ def register_workspace_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="workspace.list",
-            description="List bounded metadata for one allowed workspace directory.",
+            description=(
+                "List bounded metadata for one allowed workspace directory. "
+                "The path must be a directory; use workspace.read for a file."
+            ),
             params_model=WorkspaceListParams,
             policy=read_policy,
             handler=workspace_list,
+            preflight=preflight_workspace_list,
         )
     )
     registry.register(
         ToolDefinition(
             name="workspace.read",
-            description="Read one bounded UTF-8 byte range from an allowed workspace file.",
+            description=(
+                "Read one bounded UTF-8 byte range from an allowed workspace file. "
+                "The path must be a file; use workspace.list for a directory."
+            ),
             params_model=WorkspaceReadParams,
             policy=read_policy,
             handler=workspace_read,
+            preflight=preflight_workspace_read,
         )
     )
     registry.register(
@@ -610,6 +668,7 @@ def register_workspace_tools(registry: ToolRegistry) -> None:
             params_model=WorkspaceSearchParams,
             policy=search_policy,
             handler=workspace_search,
+            preflight=preflight_workspace_search,
         )
     )
     mutation_policy = ToolPolicy(
@@ -627,6 +686,7 @@ def register_workspace_tools(registry: ToolRegistry) -> None:
             params_model=WorkspaceWriteParams,
             policy=mutation_policy,
             handler=workspace_write,
+            preflight=preview_workspace_write,
             approval_previewer=preview_workspace_write,
         )
     )
@@ -637,6 +697,7 @@ def register_workspace_tools(registry: ToolRegistry) -> None:
             params_model=WorkspacePatchParams,
             policy=mutation_policy,
             handler=workspace_patch,
+            preflight=preview_workspace_patch,
             approval_previewer=preview_workspace_patch,
         )
     )
@@ -647,6 +708,7 @@ def register_workspace_tools(registry: ToolRegistry) -> None:
             params_model=WorkspaceDeleteParams,
             policy=mutation_policy.model_copy(update={"risk": RiskLevel.DANGEROUS}),
             handler=workspace_delete,
+            preflight=preview_workspace_delete,
             approval_previewer=preview_workspace_delete,
         )
     )
@@ -704,24 +766,79 @@ def _read_text_chunk(
     if params.offset_bytes > total_bytes:
         raise WorkspacePathDeniedError("offset exceeds file size")
     with file_path.open("rb") as stream:
-        stream.seek(params.offset_bytes)
+        actual_offset = _align_utf8_offset(
+            stream,
+            params.offset_bytes,
+            total_bytes,
+            resolver.relative_name(file_path),
+        )
+        stream.seek(actual_offset)
         raw = stream.read(params.max_bytes + 1)
     candidate = raw[: params.max_bytes]
     if b"\x00" in candidate:
         raise WorkspaceBinaryFileError(resolver.relative_name(file_path))
     content, decoded_bytes = _decode_complete_utf8(candidate, resolver.relative_name(file_path))
-    next_offset = params.offset_bytes + decoded_bytes
+    next_offset = actual_offset + decoded_bytes
     truncated = next_offset < total_bytes
     return WorkspaceReadResult(
         path=resolver.relative_name(file_path),
         content=content,
-        offset_bytes=params.offset_bytes,
+        requested_offset_bytes=params.offset_bytes,
+        actual_offset_bytes=actual_offset,
+        offset_bytes=actual_offset,
         bytes_read=decoded_bytes,
         total_bytes=total_bytes,
         sha256=_sha256_file(file_path) if total_bytes <= 4 * 1024 * 1024 else None,
         truncated=truncated,
         next_offset_bytes=next_offset if truncated else None,
     )
+
+
+def _align_utf8_offset(
+    stream: BinaryIO,
+    requested: int,
+    total_bytes: int,
+    display_path: str,
+) -> int:
+    """Move a continuation-byte offset back to its UTF-8 sequence start."""
+
+    if requested == 0 or requested == total_bytes:
+        return requested
+    stream.seek(requested)
+    current = stream.read(1)
+    if not current or current[0] & 0xC0 != 0x80:
+        return requested
+
+    probe_start = max(0, requested - 3)
+    stream.seek(probe_start)
+    probe = stream.read(min(requested - probe_start + 4, total_bytes - probe_start))
+    relative = requested - probe_start
+    lead_index = relative - 1
+    while lead_index >= 0 and probe[lead_index] & 0xC0 == 0x80:
+        lead_index -= 1
+    if lead_index < 0:
+        raise WorkspaceBinaryFileError(display_path)
+    lead = probe[lead_index]
+    expected = (
+        2
+        if 0xC2 <= lead <= 0xDF
+        else 3
+        if 0xE0 <= lead <= 0xEF
+        else 4
+        if 0xF0 <= lead <= 0xF4
+        else 0
+    )
+    sequence = probe[lead_index : lead_index + expected]
+    if expected == 0 or len(sequence) != expected:
+        raise WorkspaceBinaryFileError(display_path)
+    try:
+        sequence.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise WorkspaceBinaryFileError(display_path) from error
+    actual = probe_start + lead_index
+    if requested >= actual + expected:
+        raise WorkspaceBinaryFileError(display_path)
+    return actual
 
 
 def _decode_complete_utf8(content: bytes, display_path: str) -> tuple[str, int]:

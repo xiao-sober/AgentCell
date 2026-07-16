@@ -15,6 +15,8 @@ from agentcell.api.schemas import (
     ConversationTurnRequest,
     RunResponse,
 )
+from agentcell.conversations import ConversationRoutingMode
+from agentcell.routing import TaskRouteStatus
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -74,6 +76,43 @@ async def create_conversation_run(
     values = body.model_dump(exclude={"budget"})
     if body.budget is not None:
         values["budget"] = body.budget
-    prepared = await application.conversations.prepare_turn(conversation_id, **values)
-    run = await application.start_conversation_turn(prepared)
+    conversation = await application.conversations.get(
+        conversation_id,
+        user_id=body.user_id,
+    )
+    if (
+        conversation.routing_mode is ConversationRoutingMode.AUTO
+        or conversation.team_id is not None
+    ):
+        values["budget"] = body.budget or application.teams.get("software").default_budget
+        if application.conversations.should_use_direct_turn(
+            conversation,
+            prompt=body.prompt,
+            agent_id=body.agent_id,
+            team_id=body.team_id,
+        ):
+            prepared = await application.conversations.prepare_direct_turn(
+                conversation_id,
+                prompt=body.prompt,
+                user_id=body.user_id,
+                permission_mode=body.permission_mode,
+                budget=values["budget"],
+                model_ref=body.model_ref,
+                run_id=body.run_id,
+            )
+            run = await application.start_conversation_turn(prepared)
+        else:
+            prepared_route = await application.conversations.prepare_routed_turn(
+                conversation_id,
+                **values,
+            )
+            if prepared_route.decision.status is TaskRouteStatus.READY:
+                run = await application.start_routed_conversation_turn(prepared_route)
+            else:
+                run = prepared_route.root
+    else:
+        values.pop("agent_id", None)
+        values.pop("team_id", None)
+        prepared = await application.conversations.prepare_turn(conversation_id, **values)
+        run = await application.start_conversation_turn(prepared)
     return RunResponse.from_domain(run)

@@ -158,9 +158,9 @@ uv run pytest tests/provider_contract/test_live_providers.py -k streaming -vv
 
 ## 9. 阶段 9.2.1 真实运行回归
 
-真实运行已暴露两个必须由公共运行时修复、而不是厂商条件分支掩盖的问题：
+真实运行暴露的两个问题已经由公共运行时完成收口，没有加入厂商条件分支：
 
-- DeepSeek 可能把未解析 DSML 工具协议作为普通文本返回。若文本主体是 `<｜｜DSML｜｜tool_calls>`、`invoke`、未完成 Function Call 或继续调用不存在的 `artifact_list`，FinalOutputGuard 必须在 `run.completed` 前拒绝；运行时不得从该文本直接执行工具。先保证压缩摘要、真实工具目录和最终无工具重试一致；只有测试证明必须重新读取已引用大内容时，才增加受当前 Run/Conversation 引用范围约束的 `artifact.load`。一次预算内最终回答重试仍失败时返回 `invalid_final_output`。
-- Qwen 可能为 `workspace.read` 自行估算 byte offset，并落在中文 UTF-8 continuation byte。读取器必须对齐合法边界并返回 requested/actual/next offset，不能把合法文件误报为 binary；真实非法字节仍拒绝。阶段 9.2.1 先完成兼容修复，只有实际出现文件版本竞争时再增加绑定哈希的 opaque Cursor。一次有界工具参数纠正后仍失败才终止 Run。
+- DeepSeek 可能把未解析 DSML 工具协议作为普通文本返回。FinalOutputGuard 现在会在 `run.completed` 前拒绝以 `<｜｜DSML｜｜tool_calls>`、`invoke`、未完成 Function Call 或继续调用不存在工具为主体的文本；运行时不从文本直接执行工具。第一次拒绝触发计入预算的无工具最终回答重试，第二次返回 `invalid_final_output`；压缩摘要已提供有界脱敏预览，尚未增加任意 `artifact.load`。
+- Qwen 可能为 `workspace.read` 自行估算 byte offset，并落在中文 UTF-8 continuation byte。读取器现在对齐到合法字符起点并返回 requested/actual/next offset，合法文件不再误报 binary，真实非法字节仍拒绝。模型也可能把目录传给只接受文件的 `workspace.read`；工具 Schema 现明确 `read=file/list=directory`，无副作用 preflight 的路径类型错误和安全相对路径租约不匹配只允许一次全 Run 共享的有界模型纠正，第二次直接失败。文件版本 Cursor 仍留到出现真实竞争需求后再设计。
 
-离线契约测试使用固定响应和 UTF-8 字节夹具覆盖上述路径；真实 Provider 冒烟测试只在显式开关下运行，并断言 Usage、事件、预算和终态均正确。公共 Kernel、Tool 和 FinalOutputGuard 只根据协议与数据形态判断，不得出现 DeepSeek/Qwen 名称分支。
+离线契约测试使用固定响应和 UTF-8 字节夹具覆盖上述路径；真实 Provider 冒烟测试通过完整 RunService 运行，只在显式开关下执行并断言 Usage、事件、预算和终态均正确。公共 Kernel、Tool 和 FinalOutputGuard 只根据协议与数据形态判断，不得出现 DeepSeek/Qwen 名称分支。本轮未启用付费开关，因此线上通过状态仍待密钥环境验证。

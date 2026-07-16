@@ -66,9 +66,9 @@ ToolRegistry
 - ToolPolicy 超时为 120 秒，取消或失败时终止当前子进程；
 - 超过 64 KiB 的成功结果由 ToolExecutor 转为 Artifact。
 
-两个 Shell 工具都标记为 DANGEROUS、需要审批且非幂等。`shell.test` 只是产品语义名称，不能假定任意测试命令可安全自动重试。
+两个 Shell 工具都标记为 DANGEROUS、需要审批且非幂等。`shell.test` 不会自动重试；它还会为直接 `pytest`/`python -m pytest` 结果生成保守的结构化执行证据。只有可识别的测试结果摘要、退出码 0 且不是 `--collect-only` 时才标记为真实成功，未知命令或未知输出不会触发运行时成功快路径。
 
-CLI 使用可重复的 `--allow-command` 构建本 Run 的精确命令集合，没有内置的通用安全命令表。`pytest`、`python -m pytest` 与 `uv run pytest` 的 `command` 分别是 `pytest`、`python`、`uv`，必须分别授权；批准 `python` 或 `uv` 等解释器/启动器的权限范围显著大于只批准 `pytest`。`full` 只自动作出审批决定，不会把 `pytest` 租约扩大为 `python`。参数不经 Shell 解释，因此管道、`>`、`2>&1` 等文本不能作为重定向使用。
+CLI 使用 `--command-profile pytest|ruff|pyright` 或可重复的高级 `--command` 构建本 Run 的精确命令集合，没有内置的通用安全命令表。`pytest`、`python -m pytest` 与 `uv run pytest` 的 `command` 分别是 `pytest`、`python`、`uv`，必须分别授权；command profile 只加入同名 executable，不会隐式批准解释器或启动器。批准 `python` 或 `uv` 的权限范围显著大于只批准 `pytest`。`full` 只自动作出审批决定，不会把 `pytest` 租约扩大为 `python`。参数不经 Shell 解释，因此管道、`>`、`2>&1` 等文本不能作为重定向使用。旧 `--allow-command` 只作为一个版本的隐藏兼容入口。
 
 首版 Shell 是进程级约束，不是强隔离沙箱。被批准的解释器或构建工具仍可能自行访问系统资源，也可能创建后代进程；高对抗场景需要后续强隔离 Sandbox。
 

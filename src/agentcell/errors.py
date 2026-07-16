@@ -13,6 +13,7 @@ class AgentCellError(Exception):
 
     code: ClassVar[str] = "agentcell_error"
     retryable: bool = False
+    model_correctable: bool = False
 
 
 class ConfigurationError(AgentCellError):
@@ -133,6 +134,22 @@ class AgentNotFoundError(ConfigurationError):
         super().__init__(f"Agent {agent_id!r} is not registered")
 
 
+class TeamNotFoundError(ConfigurationError):
+    """Raised when a stable Team identifier is not registered."""
+
+    code = "team_not_found"
+
+    def __init__(self, team_id: str) -> None:
+        self.team_id = team_id
+        super().__init__(f"Team {team_id!r} is not registered")
+
+
+class TeamRegistrationError(ConfigurationError):
+    """Raised for duplicate or internally inconsistent Team declarations."""
+
+    code = "team_registration_error"
+
+
 class ToolError(AgentCellError):
     """Base class for safe, classified tool-system failures."""
 
@@ -179,6 +196,7 @@ class CapabilityEscalationError(ToolError):
     """Raised when a child lease would exceed its parent's authority."""
 
     code = "capability_escalation"
+    model_correctable = True
 
     def __init__(self, capability: str) -> None:
         self.capability = capability
@@ -190,8 +208,9 @@ class ToolApprovalRequiredError(ToolError):
 
     code = "tool_approval_required"
 
-    def __init__(self, tool_name: str) -> None:
+    def __init__(self, tool_name: str, *, preview: object | None = None) -> None:
         self.tool_name = tool_name
+        self.preview = preview
         super().__init__(f"Tool {tool_name!r} requires approval")
 
 
@@ -266,6 +285,13 @@ class WorkspacePathDeniedError(WorkspacePathError):
         super().__init__(f"Workspace path denied: {reason}")
 
 
+class WorkspaceLeaseMismatchError(WorkspacePathDeniedError):
+    """A safe relative path is outside the Run's declared filesystem scopes."""
+
+    code = "workspace_lease_mismatch"
+    model_correctable = True
+
+
 class WorkspacePathNotFoundError(WorkspacePathError):
     """Raised when an allowed workspace path does not exist."""
 
@@ -280,6 +306,7 @@ class WorkspacePathTypeError(WorkspacePathError):
     """Raised when a file operation receives a directory or vice versa."""
 
     code = "workspace_path_type_error"
+    model_correctable = True
 
     def __init__(self, path: str, expected: str) -> None:
         self.path = path
@@ -342,6 +369,11 @@ class ShellCommandDeniedError(ShellError):
         super().__init__(f"Shell command {command!r} is not granted by the Run lease")
 
 
+class ShellCommandLeaseMismatchError(ShellCommandDeniedError):
+    code = "shell_command_lease_mismatch"
+    model_correctable = True
+
+
 class ShellOutputTooLargeError(ShellError):
     code = "shell_output_too_large"
 
@@ -357,6 +389,11 @@ class HttpToolError(ToolError):
 
 class HttpRequestDeniedError(HttpToolError):
     code = "http_request_denied"
+
+
+class HttpDomainLeaseMismatchError(HttpRequestDeniedError):
+    code = "http_domain_lease_mismatch"
+    model_correctable = True
 
     def __init__(self, reason: str) -> None:
         super().__init__(f"HTTP request denied: {reason}")
@@ -393,6 +430,12 @@ class ConversationConflictError(ConversationError):
     code = "conversation_conflict"
 
 
+class ConversationModelBindingError(ConversationConflictError):
+    """Raised when a turn would change or guess a Conversation's bound model."""
+
+    code = "conversation_model_binding"
+
+
 class ConversationScopeError(ConversationError):
     code = "conversation_scope_mismatch"
 
@@ -426,6 +469,15 @@ class RunExecutionError(AgentCellError):
         super().__init__(message)
 
 
+class RunIdentityMismatchError(AgentCellError):
+    """Raised when restart recovery cannot prove the original execution identity."""
+
+    code = "run_identity_mismatch"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class ModelOutputError(AgentCellError):
     """Raised when the model exhausts its bounded final-output retries."""
 
@@ -436,6 +488,15 @@ class ModelOutputError(AgentCellError):
         super().__init__(
             f"Model did not produce an acceptable final response after {attempts} attempts"
         )
+
+
+class InvalidFinalOutputError(AgentCellError):
+    """Raised after unresolved tool-protocol text fails its one guarded retry."""
+
+    code = "invalid_final_output"
+
+    def __init__(self) -> None:
+        super().__init__("Model returned unresolved tool protocol as its final response twice")
 
 
 class ApprovalError(DomainError):

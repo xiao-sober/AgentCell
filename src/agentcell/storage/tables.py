@@ -77,6 +77,12 @@ class ConversationRow(Base):
     project_id: Mapped[str] = mapped_column(String(512), nullable=False)
     workspace: Mapped[str] = mapped_column(String(2048), nullable=False)
     agent_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    routing_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="fixed", server_default=text("'fixed'")
+    )
+    team_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    routing_policy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     active_run_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     next_message_sequence: Mapped[int] = mapped_column(
@@ -107,6 +113,7 @@ class RunRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     conversation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     agent_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    execution_identity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     parent_run_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("runs.id", ondelete="SET NULL"),

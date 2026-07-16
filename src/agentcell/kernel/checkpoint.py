@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentcell.budgets import BudgetSnapshot
 from agentcell.events import JsonValue
+from agentcell.kernel.identity import RunExecutionIdentity
 from agentcell.kernel.lifecycle import RunStatus
 from agentcell.policy import CapabilityLease, PermissionMode
 
@@ -19,6 +20,7 @@ class CheckpointKind(StrEnum):
     BRANCH = "branch"
     DELEGATION = "delegation"
     HANDOFF = "handoff"
+    TASK_ROUTE = "task_route"
 
 
 class Checkpoint(BaseModel):
@@ -32,10 +34,12 @@ class Checkpoint(BaseModel):
     event_sequence: int = Field(ge=1, strict=True)
     kind: CheckpointKind
     agent_id: str = Field(min_length=1)
+    execution_identity: RunExecutionIdentity | None = None
     prompt: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
     lease: CapabilityLease
     permission_mode: PermissionMode = PermissionMode.REQUEST
+    finalize_after_successful_test: bool = False
     budget: BudgetSnapshot
     messages: list[JsonValue]
     pending_approval_ids: tuple[UUID, ...] = ()

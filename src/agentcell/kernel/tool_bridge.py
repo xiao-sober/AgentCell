@@ -6,23 +6,35 @@ from collections.abc import Sequence
 from math import ceil
 from typing import cast
 
-from pydantic import ValidationError
-from pydantic_ai import ApprovalRequired, CallDeferred, RunContext, Tool, ToolDefinition
+from pydantic_ai import (
+    ApprovalRequired,
+    CallDeferred,
+    ModelRetry,
+    RunContext,
+    Tool,
+    ToolDefinition,
+)
 
-from agentcell.budgets import BudgetTracker
+from agentcell.budgets import FINAL_OUTPUT_ATTEMPTS, BudgetTracker
 from agentcell.errors import (
+    AgentCellError,
+    BudgetExceededError,
     ToolApprovalRequiredError,
-    ToolArgumentsError,
     ToolCallDeferredError,
     ToolRegistrationError,
 )
 from agentcell.events import JsonValue
 from agentcell.kernel.deps import RunDeps
 from agentcell.providers.tool_names import portable_tool_name
-from agentcell.tools import ToolCall, ToolRegistry
+from agentcell.tools import (
+    ToolApprovalPreview,
+    ToolCall,
+    ToolRegistry,
+    is_successful_test_result,
+)
 
-FINAL_OUTPUT_RETRIES = 2
-FINAL_REQUEST_ATTEMPTS = FINAL_OUTPUT_RETRIES + 1
+FINAL_REQUEST_ATTEMPTS = FINAL_OUTPUT_ATTEMPTS
+FINAL_OUTPUT_RETRIES = FINAL_REQUEST_ATTEMPTS - 1
 
 
 def reserve_final_model_request(
@@ -31,7 +43,14 @@ def reserve_final_model_request(
 ) -> ToolDefinition | None:
     """Hide tools when only the final model request remains so the Run can synthesize."""
 
-    if not context.deps.has_deferred_tool_results and _should_finalize(context.deps.budget):
+    deferred_at = context.deps.deferred_tool_results_at_request
+    deferred_recovery_active = (
+        deferred_at is not None and context.deps.budget.usage.requests <= deferred_at
+    )
+    if (
+        context.deps.final_output.force_no_tools
+        or context.deps.final_output.runtime_finalize_reason is not None
+    ) or (not deferred_recovery_active and _should_finalize(context.deps.budget)):
         return None
     return tool_definition
 
@@ -40,6 +59,25 @@ def budget_instructions(context: RunContext[RunDeps]) -> str:
     """Provide a cache-stable budget policy and a stable final-window instruction."""
 
     tracker = context.deps.budget
+    if context.deps.final_output.runtime_finalize_reason == "successful_test":
+        return (
+            "The full requested test command completed successfully. Runtime policy has ended "
+            "the investigation window. Tools are unavailable; report the successful persisted "
+            "test result, state that no repair was required, and do not inspect more files."
+        )
+    if context.deps.final_output.runtime_finalize_reason == "tool_budget_exhausted":
+        return (
+            "The actual tool execution budget is exhausted. Any excess calls in the previous "
+            "model response were rejected without execution and recorded for audit. Tools are "
+            "unavailable; produce the best final answer now from results already collected."
+        )
+    if context.deps.final_output.force_no_tools:
+        return (
+            "The previous final response was rejected because it was unresolved tool protocol. "
+            "Tools are unavailable for this one bounded retry. Return only a normal user-facing "
+            "answer from evidence already collected; do not emit DSML, function-call JSON, tool "
+            "tags, or plans to call a tool."
+        )
     if _should_finalize(tracker):
         return (
             "The Run has entered its reserved final-answer window. Do not call or propose any "
@@ -60,11 +98,14 @@ def _should_finalize(tracker: BudgetTracker) -> bool:
     remaining = tracker.remaining
     max_requests = tracker.budget.max_requests
     request_reserve = (
-        0 if max_requests == 0 else min(FINAL_REQUEST_ATTEMPTS, max(1, max_requests // 5))
+        0 if max_requests == 0 else min(FINAL_REQUEST_ATTEMPTS, max(1, max_requests - 1))
     )
     tool_reserve = min(4, tracker.budget.max_tool_calls // 5)
-    count_limit_reached = (request_reserve > 0 and remaining.requests <= request_reserve) or (
-        tool_reserve > 0 and remaining.tool_calls <= tool_reserve
+    tool_budget_exhausted = tracker.budget.max_tool_calls > 0 and remaining.tool_calls == 0
+    count_limit_reached = (
+        (request_reserve > 0 and remaining.requests <= request_reserve)
+        or (tool_reserve > 0 and remaining.tool_calls <= tool_reserve)
+        or tool_budget_exhausted
     )
     if count_limit_reached:
         return True
@@ -105,6 +146,13 @@ def _build_agent_tool(tool_name: str, registry: ToolRegistry) -> Tool[RunDeps]:
     definition = registry.get(tool_name)
 
     async def invoke(context: RunContext[RunDeps], **arguments: object) -> object:
+        if context.deps.final_output.runtime_finalize_reason not in (
+            None,
+            "tool_budget_exhausted",
+        ):
+            raise ModelRetry(
+                "Runtime evidence is already sufficient. Return the final answer without tools."
+            )
         call = ToolCall(
             provider_call_id=context.tool_call_id,
             tool_name=definition.name,
@@ -132,16 +180,7 @@ def _build_agent_tool(tool_name: str, registry: ToolRegistry) -> Tool[RunDeps]:
         except ToolCallDeferredError as error:
             raise CallDeferred(metadata=error.metadata) from error
         except ToolApprovalRequiredError as error:
-            preview = None
-            if definition.approval_previewer is not None:
-                try:
-                    params = definition.params_model.model_validate(arguments)
-                except ValidationError as validation_error:
-                    raise ToolArgumentsError(definition.name) from validation_error
-                preview = await definition.approval_previewer(
-                    params,
-                    context.deps.tool_context(provider_call_id=context.tool_call_id),
-                )
+            preview = error.preview if isinstance(error.preview, ToolApprovalPreview) else None
             raise ApprovalRequired(
                 metadata={
                     "tool_name": definition.name,
@@ -166,6 +205,33 @@ def _build_agent_tool(tool_name: str, registry: ToolRegistry) -> Tool[RunDeps]:
                     "model": context.deps.model,
                 }
             ) from error
+        except BudgetExceededError as error:
+            if error.resource != "tool_calls":
+                raise
+            context.deps.final_output.finalize("tool_budget_exhausted")
+            return {
+                "tool_name": definition.name,
+                "status": "rejected",
+                "error": {
+                    "code": "tool_budget_exhausted",
+                    "message": (
+                        "This tool call was not executed because the Run's actual tool "
+                        "execution budget is exhausted. Produce the final answer from "
+                        "results already collected."
+                    ),
+                },
+                "remaining_tool_calls": 0,
+            }
+        except AgentCellError as error:
+            if error.model_correctable and context.deps.tool_retries.consume():
+                raise ModelRetry(str(error)) from error
+            raise
+        if (
+            context.deps.finalize_after_successful_test
+            and result.tool_name == "shell.test"
+            and is_successful_test_result(result.output)
+        ):
+            context.deps.final_output.finalize("successful_test")
         return result.model_dump(mode="json")
 
     tool = cast(

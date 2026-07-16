@@ -11,6 +11,7 @@ from agentcell.api.routes.resources import (
 from agentcell.api.routes.runs import approval_router
 from agentcell.api.routes.runs import router as run_router
 from agentcell.api.routes.system import router as system_router
+from agentcell.api.routes.tasks import router as task_router
 
 __all__ = [
     "agent_router",
@@ -21,5 +22,6 @@ __all__ = [
     "provider_router",
     "run_router",
     "system_router",
+    "task_router",
     "tool_router",
 ]

@@ -71,6 +71,23 @@ class FakeToolCallStep(BaseModel):
     usage: ModelUsage = Field(default_factory=ModelUsage)
 
 
+class FakeToolCallsStep(BaseModel):
+    """Multiple deterministic function calls returned in one model response."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["tool_calls"] = "tool_calls"
+    calls: tuple[FakeToolCallStep, ...] = Field(min_length=2)
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+
+    @model_validator(mode="after")
+    def validate_call_ids(self) -> FakeToolCallsStep:
+        call_ids = tuple(call.tool_call_id for call in self.calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("calls must use unique tool_call_id values")
+        return self
+
+
 class FakeFailureStep(BaseModel):
     """One deterministic, already classified Provider failure."""
 
@@ -81,7 +98,7 @@ class FakeFailureStep(BaseModel):
 
 
 type FakeStep = Annotated[
-    FakeTextStep | FakeToolCallStep | FakeFailureStep,
+    FakeTextStep | FakeToolCallStep | FakeToolCallsStep | FakeFailureStep,
     Field(discriminator="kind"),
 ]
 
@@ -162,6 +179,19 @@ class FakeProviderAdapter:
                     usage=step.usage.to_request_usage(),
                     finish_reason="stop",
                 )
+            if isinstance(step, FakeToolCallsStep):
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            _resolve_script_tool_name(call.tool_name, agent_info),
+                            call.arguments,
+                            call.tool_call_id,
+                        )
+                        for call in step.calls
+                    ],
+                    usage=step.usage.to_request_usage(),
+                    finish_reason="tool_call",
+                )
             tool_name = _resolve_script_tool_name(step.tool_name, agent_info)
             return ModelResponse(
                 parts=[
@@ -186,6 +216,20 @@ class FakeProviderAdapter:
             if isinstance(step, FakeTextStep):
                 for chunk in step.stream_chunks():
                     yield chunk
+                return
+            if isinstance(step, FakeToolCallsStep):
+                yield {
+                    index: DeltaToolCall(
+                        name=_resolve_script_tool_name(call.tool_name, agent_info),
+                        json_args=json.dumps(
+                            call.arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        tool_call_id=call.tool_call_id,
+                    )
+                    for index, call in enumerate(step.calls)
+                }
                 return
             tool_name = _resolve_script_tool_name(step.tool_name, agent_info)
             yield {

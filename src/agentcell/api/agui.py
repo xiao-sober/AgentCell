@@ -20,6 +20,7 @@ from ag_ui.core import (
     ToolCallStartEvent,
 )
 
+from agentcell.display import redact_display_text
 from agentcell.events import (
     DomainEvent,
     ErrorPayload,
@@ -75,11 +76,25 @@ class AgUiEventMapper:
             )
         if event.event_type is EventType.MODEL_TEXT_DELTA and isinstance(payload, TextDeltaPayload):
             if state.active_message_id is None:
-                return self._custom(event, timestamp)
+                message_id = f"{event.run_id}:message:projected"
+                state.active_message_id = message_id
+                state.last_message_id = message_id
+                return (
+                    TextMessageStartEvent(
+                        message_id=message_id,
+                        role="assistant",
+                        timestamp=timestamp,
+                    ),
+                    TextMessageContentEvent(
+                        message_id=message_id,
+                        delta=redact_display_text(payload.delta, limit=16_000),
+                        timestamp=timestamp,
+                    ),
+                )
             return (
                 TextMessageContentEvent(
                     message_id=state.active_message_id,
-                    delta=payload.delta,
+                    delta=redact_display_text(payload.delta, limit=16_000),
                     timestamp=timestamp,
                 ),
             )
@@ -93,10 +108,11 @@ class AgUiEventMapper:
             state.last_message_id = message_id
             return (TextMessageEndEvent(message_id=message_id, timestamp=timestamp),)
         if event.event_type is EventType.TOOL_PROPOSED and isinstance(payload, GenericEventPayload):
-            call_id = str(payload.data.get("provider_call_id") or payload.data.get("call_id"))
-            name = str(payload.data.get("tool_name") or "unknown")
+            safe_data = _safe_data(event)
+            call_id = str(safe_data.get("provider_call_id") or safe_data.get("call_id"))
+            name = str(safe_data.get("tool_name") or "unknown")
             arguments = json.dumps(
-                payload.data.get("arguments", {}),
+                safe_data.get("arguments", {}),
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -119,8 +135,12 @@ class AgUiEventMapper:
         if event.event_type is EventType.TOOL_COMPLETED and isinstance(
             payload, GenericEventPayload
         ):
-            call_id = str(payload.data.get("provider_call_id") or payload.data.get("call_id"))
-            content = json.dumps(payload.data, ensure_ascii=False, separators=(",", ":"))
+            safe_data = _safe_data(event)
+            call_id = str(safe_data.get("provider_call_id") or safe_data.get("call_id"))
+            content = redact_display_text(
+                json.dumps(safe_data, ensure_ascii=False, separators=(",", ":")),
+                limit=32_000,
+            )
             return (
                 ToolCallResultEvent(
                     message_id=f"{event.run_id}:tool-result:{call_id}",
@@ -131,18 +151,24 @@ class AgUiEventMapper:
                 ),
             )
         if event.event_type is EventType.RUN_COMPLETED and isinstance(payload, RunCompletedPayload):
+            finished = RunFinishedEvent(
+                thread_id=state.thread_id or str(event.run_id),
+                run_id=str(event.run_id),
+                result=payload.model_dump(mode="json"),
+                timestamp=timestamp,
+            )
+            if state.active_message_id is None:
+                return (finished,)
+            message_id = state.active_message_id
+            state.active_message_id = None
             return (
-                RunFinishedEvent(
-                    thread_id=state.thread_id or str(event.run_id),
-                    run_id=str(event.run_id),
-                    result=payload.model_dump(mode="json"),
-                    timestamp=timestamp,
-                ),
+                TextMessageEndEvent(message_id=message_id, timestamp=timestamp),
+                finished,
             )
         if event.event_type is EventType.RUN_FAILED and isinstance(payload, ErrorPayload):
             return (
                 RunErrorEvent(
-                    message=payload.message,
+                    message=redact_display_text(payload.message, limit=2_000),
                     code=payload.code,
                     timestamp=timestamp,
                 ),
@@ -170,3 +196,8 @@ class AgUiEventMapper:
                 timestamp=timestamp,
             ),
         )
+
+
+def _safe_data(event: DomainEvent[EventPayload]) -> dict[str, object]:
+    safe = event.safe_payload().get("data")
+    return dict(safe) if isinstance(safe, dict) else {}

@@ -120,6 +120,51 @@ async def test_read_is_chunked_on_complete_utf8_boundaries(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested", [1, 2, 4])
+async def test_read_aligns_arbitrary_utf8_continuation_offsets(
+    tmp_path: Path,
+    requested: int,
+) -> None:
+    (tmp_path / "unicode.txt").write_text("你🙂好", encoding="utf-8")
+
+    raw = await _executor().execute(
+        ToolCall(
+            tool_name="workspace.read",
+            arguments={
+                "path": "unicode.txt",
+                "offset_bytes": requested,
+                "max_bytes": 4,
+            },
+        ),
+        _context(tmp_path),
+    )
+    result = WorkspaceReadResult.model_validate(raw.output)
+
+    assert result.requested_offset_bytes == requested
+    assert result.offset_bytes == result.actual_offset_bytes
+    assert result.actual_offset_bytes == (0 if requested < 3 else 3)
+    assert result.content in {"你", "🙂"}
+
+
+@pytest.mark.asyncio
+async def test_read_rejects_isolated_utf8_continuation_byte(tmp_path: Path) -> None:
+    (tmp_path / "invalid.txt").write_bytes(b"a\x80b")
+
+    with pytest.raises(WorkspaceBinaryFileError):
+        await _executor().execute(
+            ToolCall(
+                tool_name="workspace.read",
+                arguments={
+                    "path": "invalid.txt",
+                    "offset_bytes": 1,
+                    "max_bytes": 4,
+                },
+            ),
+            _context(tmp_path),
+        )
+
+
+@pytest.mark.asyncio
 async def test_literal_search_is_bounded_and_skips_binary_files(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()

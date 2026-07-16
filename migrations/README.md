@@ -53,6 +53,18 @@
 - `prepared/applied/completed/conflict/failed/reverted` 恢复状态和 Run/ChangeSet 时间顺序索引；
 - 文件内容仍位于受哈希校验的 Artifact Store，数据库只保存稳定引用和恢复投影。
 
+`versions/20260715_0008_add_run_execution_identity.py` 增加：
+
+- `runs.execution_identity`：保存版本化 AgentSpec 与 ModelSpec 快照及各自 SHA-256，用于恢复、审批和分支时校验不可变执行身份；
+- 字段保持 nullable 以允许既有数据库完成迁移，但缺少快照的旧 Run 不得继续模型执行或审批恢复，必须以 `run_identity_mismatch` 安全失败；
+- 降级只移除该列，不改写既有事件、审批、检查点或文件变更历史。
+
+`versions/20260715_0009_bind_conversation_model.py` 增加：
+
+- `conversations.model_ref`：新 Conversation 固定其配置模型，后续回合不得随进程默认模型或 TOML 顺序漂移；
+- 既有 Conversation 优先从已完成 Run 的 `execution_identity.model_ref` 回填，再回退到持久化 AgentSpec；无法可靠推断的空历史旧会话保持未绑定，并要求用户显式选择一次模型；
+- 回填直接读取身份 JSON，不要求历史 v1 capability 哈希先通过当前进程顺序校验。
+
 ## 命令
 
 ```powershell
@@ -63,4 +75,10 @@ uv run alembic downgrade base
 
 默认数据库为 `.agentcell/agentcell.db`，可通过 `AGENTCELL_DATABASE_URL` 覆盖。URL 必须使用 `sqlite+aiosqlite`。
 
-测试从独立临时数据库执行升级和降级，并验证 WAL、外键、5000ms busy timeout、只追加触发器、FTS5 同步触发器、Run 事件 sequence 和 Conversation 消息 sequence。
+测试从独立临时数据库执行升级、降级和 Alembic metadata check，并验证 WAL、外键、5000ms busy timeout、只追加触发器、FTS5 同步触发器、Run 事件 sequence、Conversation 消息 sequence、执行身份列和 Conversation 模型回填。
+
+阶段 9.2.2 主体没有新增持久化结构；续聊正确性补丁增加上述 Conversation 模型绑定列，当前迁移头为 `20260715_0009`。Agent 的 builtin/persisted/override 来源和 public/internal 可见性仍由应用组合确定，不写入 AgentSpec。
+
+阶段 9.3 没有新增数据库表或列。版本化 TeamSpec 由应用注册；每次实际 Team 执行继续使用既有 `runs`、`run_events`、`checkpoints` 和 `agent_delegations` 保存 root/child 状态、阶段身份、预算、租约、审批与恢复数据。该阶段结束时迁移头为 `20260715_0009`。
+
+阶段 9.4 的权威 Task Router 继续复用 `runs`、`run_events`、`checkpoints` 与 `agent_delegations`。迁移 `20260716_0010` 为 `conversations` 增加 `routing_mode`、`team_id` 和 `routing_policy_version`：既有记录以 `fixed` 回填，auto Conversation 绑定 `task-router` 与版本化 RoutingPolicy。当前迁移头为 `20260716_0010`。

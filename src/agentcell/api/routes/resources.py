@@ -26,8 +26,13 @@ memory_router = APIRouter(prefix="/memories", tags=["memories"])
 
 
 @agent_router.get("", response_model=list[AgentSpec])
-async def list_agents(application: ApplicationDependency) -> list[AgentSpec]:
-    return list(application.agents.list())
+async def list_agents(
+    application: ApplicationDependency,
+    include_internal: bool = False,
+) -> list[AgentSpec]:
+    return [
+        entry.spec for entry in application.agents.list_entries(include_internal=include_internal)
+    ]
 
 
 @agent_router.post("", response_model=AgentSpec, status_code=status.HTTP_201_CREATED)

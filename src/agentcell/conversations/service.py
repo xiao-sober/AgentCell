@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -24,19 +24,33 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from agentcell.agents import AgentRegistry, AgentSpec
+from agentcell.agents import AgentRegistry, AgentSpec, TeamRegistry
 from agentcell.budgets import Budget
 from agentcell.conversations.models import (
     Conversation,
     ConversationMessage,
     ConversationMessageKind,
+    ConversationRoutingMode,
 )
-from agentcell.errors import ConversationScopeError
+from agentcell.errors import (
+    AgentNotFoundError,
+    ConversationModelBindingError,
+    ConversationScopeError,
+    ProviderConfigurationError,
+)
 from agentcell.events import JsonValue
 from agentcell.kernel.models import Run
 from agentcell.kernel.run_service import RunRequest, RunResult, RunService
 from agentcell.memory.compaction import PairSafeTokenTrimmer, PairSafeTrimmer, ToolOutputCompactor
 from agentcell.policy import CapabilityLease, PermissionMode
+from agentcell.routing import (
+    TASK_ROUTER_AGENT_ID,
+    PreparedTaskRoute,
+    TaskExecutionResult,
+    TaskRouteRequest,
+    TaskRoutingService,
+)
+from agentcell.routing.rules import is_direct_conversation
 from agentcell.storage import (
     ConversationMessageRepository,
     ConversationRepository,
@@ -62,11 +76,21 @@ class ConversationService:
         database: Database,
         runs: RunService,
         agents: AgentRegistry,
+        teams: TeamRegistry | None = None,
+        routing: TaskRoutingService | None = None,
+        model_refs: Collection[str] | None = None,
+        default_model_ref: str | None = None,
         artifact_root: Path = Path(".agentcell/artifacts"),
     ) -> None:
         self._database = database
         self._runs = runs
         self._agents = agents
+        self._teams = teams
+        self._routing = routing
+        self._model_refs = frozenset(
+            model_refs if model_refs is not None else (item.model_ref for item in agents.list())
+        )
+        self._default_model_ref = default_model_ref
         self._artifacts = FileArtifactStore(database, artifact_root)
         self._tool_compactor = ToolOutputCompactor(self._artifacts)
 
@@ -76,11 +100,32 @@ class ConversationService:
         user_id: UUID,
         workspace: Path,
         agent_id: str = "coordinator",
+        routing_mode: ConversationRoutingMode = ConversationRoutingMode.FIXED,
+        team_id: str | None = None,
+        model_ref: str | None = None,
         project_id: str | None = None,
         title: str | None = None,
         conversation_id: UUID | None = None,
     ) -> Conversation:
-        self._agents.get(agent_id)
+        if routing_mode is ConversationRoutingMode.AUTO:
+            if team_id is not None or agent_id != "coordinator":
+                raise ConversationScopeError(
+                    "auto Conversation cannot declare a fixed Agent or Team"
+                )
+            selected_agent_id = TASK_ROUTER_AGENT_ID
+            selected_model_ref = model_ref or self._required_default_model_ref()
+            routing_policy_version = self._required_routing().policy.policy_version
+        elif team_id is not None:
+            team = self._required_teams().get(team_id)
+            selected_agent_id = TASK_ROUTER_AGENT_ID
+            selected_model_ref = model_ref or team.stages[0].model_ref
+            routing_policy_version = None
+        else:
+            spec = self._agents.get(agent_id)
+            selected_agent_id = spec.id
+            selected_model_ref = model_ref or spec.model_ref
+            routing_policy_version = None
+        self._ensure_model_configured(selected_model_ref)
         resolved = await asyncio.to_thread(workspace.resolve, strict=True)
         if not await asyncio.to_thread(resolved.is_dir):
             raise ValueError("workspace must be a directory")
@@ -89,7 +134,11 @@ class ConversationService:
             user_id=user_id,
             project_id=project_id or str(resolved),
             workspace=str(resolved),
-            agent_id=agent_id,
+            agent_id=selected_agent_id,
+            routing_mode=routing_mode,
+            team_id=team_id,
+            routing_policy_version=routing_policy_version,
+            model_ref=selected_model_ref,
             title=title,
         )
         async with self._database.transaction() as session:
@@ -130,6 +179,7 @@ class ConversationService:
         lease: CapabilityLease | None = None,
         permission_mode: PermissionMode = PermissionMode.REQUEST,
         budget: Budget | None = None,
+        model_ref: str | None = None,
         run_id: UUID | None = None,
     ) -> PreparedConversationTurn:
         selected_run_id = run_id or uuid4()
@@ -137,6 +187,22 @@ class ConversationService:
             repository = ConversationRepository(session)
             conversation = await repository.get_required(conversation_id)
             self._ensure_user(conversation, user_id)
+            if (
+                conversation.routing_mode is not ConversationRoutingMode.FIXED
+                or conversation.team_id is not None
+            ):
+                raise ConversationScopeError(
+                    "Auto or fixed-Team Conversation turns must use Task Router"
+                )
+            selected_model_ref = self._select_conversation_model(
+                conversation,
+                requested=model_ref,
+            )
+            if conversation.model_ref is None:
+                conversation = await repository.bind_model(
+                    conversation.id,
+                    selected_model_ref,
+                )
             await repository.claim(conversation_id, selected_run_id)
             stored = await ConversationMessageRepository(session).list_for_conversation(
                 conversation_id,
@@ -149,15 +215,14 @@ class ConversationService:
             agent_id=conversation.agent_id,
             conversation_id=conversation.id,
             user_id=conversation.user_id,
-            lease=lease
-            or CapabilityLease(filesystem_read=(".",), can_delegate=True, max_child_depth=2),
+            lease=lease or CapabilityLease(filesystem_read=(".",)),
             permission_mode=permission_mode,
             run_id=selected_run_id,
         )
         if budget is not None:
             request = request.model_copy(update={"budget": budget})
         try:
-            run, spec = await self._runs.prepare(request)
+            run, spec = await self._runs.prepare(request, model_ref=selected_model_ref)
             user_message = ModelRequest(parts=[UserPromptPart(prompt)])
             payload = self._dump_message(user_message)
             async with self._database.transaction() as session:
@@ -172,6 +237,212 @@ class ConversationService:
                 await ConversationRepository(session).release(conversation.id, selected_run_id)
             raise
         return PreparedConversationTurn(run, request, spec, tuple(history))
+
+    def should_use_direct_turn(
+        self,
+        conversation: Conversation,
+        *,
+        prompt: str,
+        agent_id: str | None = None,
+        team_id: str | None = None,
+    ) -> bool:
+        """Keep ordinary auto-chat turns out of routing and delegation."""
+
+        if (
+            conversation.routing_mode is not ConversationRoutingMode.AUTO
+            or conversation.team_id is not None
+            or agent_id is not None
+            or team_id is not None
+        ):
+            return False
+        try:
+            spec = self._agents.get("assistant")
+        except AgentNotFoundError:
+            return False
+        return not spec.tools and not spec.capabilities and is_direct_conversation(prompt)
+
+    async def prepare_direct_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        prompt: str,
+        user_id: UUID | None = None,
+        permission_mode: PermissionMode = PermissionMode.REQUEST,
+        budget: Budget | None = None,
+        model_ref: str | None = None,
+        run_id: UUID | None = None,
+    ) -> PreparedConversationTurn:
+        """Prepare one tool-free Agent Run inside an auto-routing Conversation."""
+
+        selected_run_id = run_id or uuid4()
+        spec = self._agents.get("assistant")
+        if spec.tools or spec.capabilities:
+            raise ConversationScopeError("Direct conversation Agent must remain tool-free")
+        async with self._database.transaction() as session:
+            repository = ConversationRepository(session)
+            conversation = await repository.get_required(conversation_id)
+            self._ensure_user(conversation, user_id)
+            if not self.should_use_direct_turn(conversation, prompt=prompt):
+                raise ConversationScopeError("Conversation turn requires Task Router")
+            selected_model_ref = self._select_conversation_model(
+                conversation,
+                requested=model_ref,
+            )
+            await repository.claim(conversation_id, selected_run_id)
+            stored = await ConversationMessageRepository(session).list_for_conversation(
+                conversation_id,
+                completed_only=True,
+            )
+        history = self._restore_history(stored)
+        request = RunRequest(
+            prompt=prompt,
+            workspace=Path(conversation.workspace),
+            agent_id=spec.id,
+            conversation_id=conversation.id,
+            user_id=conversation.user_id,
+            lease=CapabilityLease(),
+            permission_mode=permission_mode,
+            run_id=selected_run_id,
+        )
+        if budget is not None:
+            request = request.model_copy(update={"budget": self._direct_budget(budget)})
+        try:
+            run, prepared_spec = await self._runs.prepare(
+                request,
+                model_ref=selected_model_ref,
+            )
+            async with self._database.transaction() as session:
+                await ConversationMessageRepository(session).append(
+                    conversation_id=conversation.id,
+                    run_id=run.id,
+                    kind=ConversationMessageKind.REQUEST,
+                    payload=self._dump_message(ModelRequest(parts=[UserPromptPart(prompt)])),
+                )
+        except BaseException:
+            async with self._database.transaction() as session:
+                await ConversationRepository(session).release(conversation.id, selected_run_id)
+            raise
+        return PreparedConversationTurn(run, request, prepared_spec, tuple(history))
+
+    async def prepare_routed_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        prompt: str,
+        user_id: UUID | None = None,
+        lease: CapabilityLease | None = None,
+        permission_mode: PermissionMode = PermissionMode.REQUEST,
+        budget: Budget,
+        model_ref: str | None = None,
+        agent_id: str | None = None,
+        team_id: str | None = None,
+        run_id: UUID | None = None,
+    ) -> PreparedTaskRoute:
+        """Claim and route one auto or fixed-Team Conversation turn."""
+
+        selected_run_id = run_id or uuid4()
+        async with self._database.transaction() as session:
+            repository = ConversationRepository(session)
+            conversation = await repository.get_required(conversation_id)
+            self._ensure_user(conversation, user_id)
+            if (
+                conversation.routing_mode is ConversationRoutingMode.FIXED
+                and conversation.team_id is None
+            ):
+                raise ConversationScopeError("Fixed Agent Conversation does not use Task Router")
+            selected_model_ref = self._select_conversation_model(
+                conversation,
+                requested=model_ref,
+            )
+            self._validate_route_override(conversation, agent_id=agent_id, team_id=team_id)
+            await repository.claim(conversation_id, selected_run_id)
+            stored = await ConversationMessageRepository(session).list_for_conversation(
+                conversation_id,
+                completed_only=True,
+            )
+        history = self._restore_history(stored)
+        request = TaskRouteRequest(
+            task=prompt,
+            workspace=Path(conversation.workspace),
+            lease=lease or CapabilityLease(filesystem_read=(".",)),
+            permission_mode=permission_mode,
+            budget=budget,
+            user_id=conversation.user_id,
+            conversation_id=conversation.id,
+            root_run_id=selected_run_id,
+            project_id=conversation.project_id,
+            model_ref=selected_model_ref,
+            agent_id=(
+                conversation.agent_id
+                if conversation.routing_mode is ConversationRoutingMode.FIXED
+                and conversation.team_id is None
+                else agent_id
+            ),
+            team_id=conversation.team_id or team_id,
+        )
+        serialized_history = cast(
+            list[JsonValue],
+            ModelMessagesTypeAdapter.dump_python(history, mode="json"),
+        )
+        try:
+            prepared = await self._required_routing().prepare(
+                request,
+                history=serialized_history,
+            )
+            async with self._database.transaction() as session:
+                await ConversationMessageRepository(session).append(
+                    conversation_id=conversation.id,
+                    run_id=prepared.root.id,
+                    kind=ConversationMessageKind.REQUEST,
+                    payload=self._dump_message(ModelRequest(parts=[UserPromptPart(prompt)])),
+                )
+        except BaseException:
+            async with self._database.transaction() as session:
+                await ConversationRepository(session).release(
+                    conversation.id,
+                    selected_run_id,
+                )
+            raise
+        return prepared
+
+    async def execute_routed_prepared(
+        self,
+        prepared: PreparedTaskRoute,
+    ) -> TaskExecutionResult:
+        try:
+            result = await self._required_routing().execute(prepared)
+        except BaseException:
+            await self._release(prepared.root)
+            raise
+        await self.record_task_result(result)
+        return result
+
+    async def record_task_result(self, result: TaskExecutionResult) -> None:
+        """Project a routed task's safe final text and release terminal Conversations."""
+
+        async with self._database.session() as session:
+            conversation = await ConversationRepository(session).get(result.run.conversation_id)
+        if conversation is None:
+            return
+        async with self._database.transaction() as session:
+            if result.run.status.is_terminal and result.output:
+                messages = ConversationMessageRepository(session)
+                existing = await messages.list_for_conversation(conversation.id)
+                payload = self._dump_message(ModelResponse(parts=[TextPart(result.output)]))
+                if not any(
+                    item.run_id == result.run.id
+                    and item.kind is ConversationMessageKind.RESPONSE
+                    and self._payload_key(item.payload) == self._payload_key(payload)
+                    for item in existing
+                ):
+                    await messages.append(
+                        conversation_id=conversation.id,
+                        run_id=result.run.id,
+                        kind=ConversationMessageKind.RESPONSE,
+                        payload=payload,
+                    )
+            if result.run.status.is_terminal:
+                await ConversationRepository(session).release(conversation.id, result.run.id)
 
     async def execute_prepared(self, prepared: PreparedConversationTurn) -> RunResult:
         try:
@@ -245,6 +516,78 @@ class ConversationService:
     def _ensure_user(conversation: Conversation, user_id: UUID | None) -> None:
         if user_id is not None and conversation.user_id != user_id:
             raise ConversationScopeError("Conversation user scope does not match")
+
+    def _select_conversation_model(
+        self,
+        conversation: Conversation,
+        *,
+        requested: str | None,
+    ) -> str:
+        bound = conversation.model_ref
+        if bound is None:
+            if requested is None:
+                raise ConversationModelBindingError(
+                    "Legacy Conversation has no recoverable model binding; provide model_ref once"
+                )
+            self._ensure_model_configured(requested)
+            return requested
+        self._ensure_model_configured(bound)
+        if requested is not None and requested != bound:
+            raise ConversationModelBindingError(
+                f"Conversation {conversation.id} is bound to model {bound!r}; "
+                f"cannot continue as {requested!r}"
+            )
+        return bound
+
+    def _ensure_model_configured(self, model_ref: str) -> None:
+        if model_ref not in self._model_refs:
+            raise ProviderConfigurationError(
+                f"Conversation model reference {model_ref!r} is not configured"
+            )
+
+    def _required_routing(self) -> TaskRoutingService:
+        if self._routing is None:
+            raise ConversationScopeError("Conversation Task Router is not configured")
+        return self._routing
+
+    def _required_teams(self) -> TeamRegistry:
+        if self._teams is None:
+            raise ConversationScopeError("Conversation Team registry is not configured")
+        return self._teams
+
+    def _required_default_model_ref(self) -> str:
+        if self._default_model_ref is None:
+            raise ConversationModelBindingError("No default model is configured for auto routing")
+        return self._default_model_ref
+
+    @staticmethod
+    def _direct_budget(budget: Budget) -> Budget:
+        """Narrow a caller budget for a single tool-free conversational response."""
+
+        return budget.model_copy(
+            update={
+                "max_requests": min(budget.max_requests, 4),
+                "max_tool_calls": 0,
+                "max_children": 0,
+                "max_depth": 0,
+            }
+        )
+
+    @staticmethod
+    def _validate_route_override(
+        conversation: Conversation,
+        *,
+        agent_id: str | None,
+        team_id: str | None,
+    ) -> None:
+        if agent_id is not None and team_id is not None:
+            raise ConversationScopeError("agent_id and team_id overrides are mutually exclusive")
+        if conversation.routing_mode is ConversationRoutingMode.AUTO:
+            return
+        if conversation.team_id != team_id and team_id is not None:
+            raise ConversationScopeError("Fixed Team Conversation cannot switch Team")
+        if agent_id is not None:
+            raise ConversationScopeError("Fixed Team Conversation cannot switch to an Agent")
 
     @staticmethod
     def _restore_history(messages: Sequence[ConversationMessage]) -> list[ModelMessage]:

@@ -14,9 +14,12 @@ from agentcell.agents import AgentRegistry, AgentSpec
 from agentcell.budgets import Budget
 from agentcell.errors import (
     BudgetExceededError,
+    InvalidFinalOutputError,
     ModelOutputError,
     ProviderAuthenticationError,
+    WorkspaceLeaseMismatchError,
     WorkspacePathNotFoundError,
+    WorkspacePathTypeError,
 )
 from agentcell.events import ErrorPayload, EventType
 from agentcell.kernel.run_service import RunRequest, RunService
@@ -28,6 +31,7 @@ from agentcell.providers import (
     FakeProviderAdapter,
     FakeScript,
     FakeTextStep,
+    FakeToolCallsStep,
     FakeToolCallStep,
     ModelUsage,
     ProviderFactory,
@@ -269,6 +273,151 @@ async def test_final_window_retries_invalid_tool_output_then_completes(
 
 
 @pytest.mark.asyncio
+async def test_five_request_stage_keeps_budget_for_rejected_final_output(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(tool_name="workspace.list", arguments={"path": "."}),
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "."},
+                    tool_call_id="explore-2",
+                ),
+                FakeTextStep(text='<｜｜DSML｜｜tool_calls>\n<invoke name="workspace_list">'),
+                FakeTextStep(text="PASS\npersisted evidence is sufficient"),
+            )
+        ),
+        tool_names=("workspace.list",),
+        max_steps=5,
+    )
+    budget = _final_window_budget().model_copy(update={"max_requests": 5, "max_tool_calls": 10})
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="review then decide",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+                budget=budget,
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "PASS\npersisted evidence is sufficient"
+    assert result.budget.used.requests == 4
+    assert result.budget.used.tool_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_six_request_stage_allows_three_tool_exploration_rounds_and_final_retry(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=tuple(
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "."},
+                    tool_call_id=f"coordinator-explore-{index}",
+                )
+                for index in range(3)
+            )
+            + (
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "."},
+                    tool_call_id="coordinator-hidden-final-tool",
+                ),
+                FakeTextStep(text="Bounded coordinator plan."),
+            )
+        ),
+        tool_names=("workspace.list",),
+        max_steps=6,
+    )
+    budget = _final_window_budget().model_copy(update={"max_requests": 6, "max_tool_calls": 3})
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="inspect the project root then plan",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+                budget=budget,
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "Bounded coordinator plan."
+    assert result.budget.used.requests == 5
+    assert result.budget.used.tool_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_tail_over_budget_is_rejected_then_run_finalizes(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "."},
+                    tool_call_id="first-request-tool",
+                ),
+                FakeToolCallsStep(
+                    calls=tuple(
+                        FakeToolCallStep(
+                            tool_name="workspace.list",
+                            arguments={"path": "."},
+                            tool_call_id=f"deepseek-batch-{index}",
+                        )
+                        for index in range(3)
+                    )
+                ),
+                FakeTextStep(text="Bounded plan from the three completed reads."),
+            )
+        ),
+        tool_names=("workspace.list",),
+        max_steps=6,
+    )
+    budget = _final_window_budget().model_copy(update={"max_requests": 6, "max_tool_calls": 3})
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="inspect within the hard tool budget then plan",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+                budget=budget,
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    async with database.session() as session:
+        events = await EventStore(session).list_for_run(result.run.id)
+    event_types = [event.event_type for event in events]
+    rejected = next(event for event in events if event.event_type is EventType.TOOL_FAILED)
+
+    assert result.run.status.value == "completed"
+    assert result.output == "Bounded plan from the three completed reads."
+    assert result.budget.used.requests == 3
+    assert result.budget.used.tool_calls == 3
+    assert event_types.count(EventType.TOOL_COMPLETED) == 3
+    assert event_types.count(EventType.TOOL_FAILED) == 1
+    assert isinstance(rejected.payload, ErrorPayload)
+    assert rejected.payload.code == "budget_exceeded"
+    assert event_types[-1] is EventType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_exhausted_final_output_retries_are_classified(
     database: Database,
     tmp_path: Path,
@@ -313,6 +462,87 @@ async def test_exhausted_final_output_retries_are_classified(
 
 
 @pytest.mark.asyncio
+async def test_final_output_guard_retries_once_without_completing_rejected_text(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    conversation_id = uuid4()
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeTextStep(
+                    text='<｜｜DSML｜｜tool_calls>\n<invoke name="artifact_list">',
+                ),
+                FakeTextStep(text="normal final answer"),
+            )
+        ),
+        tool_names=("workspace.list",),
+    )
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="summarize",
+                workspace=tmp_path,
+                conversation_id=conversation_id,
+                lease=CapabilityLease(filesystem_read=(".",)),
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "normal final answer"
+    assert result.budget.used.requests == 2
+    async with database.session() as session:
+        row = await session.scalar(select(RunRow).where(RunRow.conversation_id == conversation_id))
+        assert row is not None
+        events = await EventStore(session).list_for_run(row.id)
+    rejected = [event for event in events if event.event_type is EventType.MODEL_OUTPUT_REJECTED]
+    assert len(rejected) == 1
+    assert events[-1].event_type is EventType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_final_output_guard_fails_with_dedicated_code_after_second_rejection(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    conversation_id = uuid4()
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeTextStep(text='{"name":"artifact_list","arguments":{}}'),
+                FakeTextStep(text='<invoke name="artifact_list">{}</invoke>'),
+            )
+        ),
+    )
+    try:
+        with pytest.raises(InvalidFinalOutputError):
+            await service.run(
+                RunRequest(
+                    prompt="summarize",
+                    workspace=tmp_path,
+                    conversation_id=conversation_id,
+                )
+            )
+    finally:
+        await providers.aclose()
+
+    async with database.session() as session:
+        row = await session.scalar(select(RunRow).where(RunRow.conversation_id == conversation_id))
+        assert row is not None
+        events = await EventStore(session).list_for_run(row.id)
+    assert (
+        len([event for event in events if event.event_type is EventType.MODEL_OUTPUT_REJECTED]) == 2
+    )
+    assert EventType.RUN_COMPLETED not in {event.event_type for event in events}
+    assert events[-1].event_type is EventType.RUN_FAILED
+    assert isinstance(events[-1].payload, ErrorPayload)
+    assert events[-1].payload.code == "invalid_final_output"
+
+
+@pytest.mark.asyncio
 async def test_tool_failure_is_persisted_before_run_failure(
     database: Database,
     tmp_path: Path,
@@ -350,6 +580,176 @@ async def test_tool_failure_is_persisted_before_run_failure(
     assert row.status == "failed"
     assert EventType.TOOL_FAILED in [event.event_type for event in events]
     assert events[-1].event_type is EventType.RUN_FAILED
+
+
+@pytest.mark.asyncio
+async def test_model_gets_one_unbudgeted_correction_for_relative_lease_mismatch(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "allowed.txt").write_text("allowed", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "denied.txt").write_text("denied", encoding="utf-8")
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "docs/denied.txt"},
+                    tool_call_id="lease-mismatch-1",
+                ),
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "src/allowed.txt"},
+                    tool_call_id="lease-corrected-1",
+                ),
+                FakeTextStep(text="corrected"),
+            )
+        ),
+        tool_names=("workspace.read",),
+    )
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="read a leased file",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=("src",)),
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "corrected"
+    assert result.budget.used.requests == 3
+    assert result.budget.used.tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_corrects_directory_read_to_workspace_list(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    tests_path = tmp_path / "tests"
+    tests_path.mkdir()
+    (tests_path / "test_example.py").write_text("def test_example(): pass\n", encoding="utf-8")
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "tests"},
+                    tool_call_id="directory-read-1",
+                ),
+                FakeToolCallStep(
+                    tool_name="workspace.list",
+                    arguments={"path": "tests"},
+                    tool_call_id="directory-list-corrected-1",
+                ),
+                FakeTextStep(text="corrected directory inspection"),
+            )
+        ),
+        tool_names=("workspace.read", "workspace.list"),
+    )
+    try:
+        result = await service.run(
+            RunRequest(
+                prompt="inspect tests",
+                workspace=tmp_path,
+                lease=CapabilityLease(filesystem_read=(".",)),
+            )
+        )
+    finally:
+        await providers.aclose()
+
+    assert result.output == "corrected directory inspection"
+    assert result.budget.used.requests == 3
+    assert result.budget.used.tool_calls == 1
+    async with database.session() as session:
+        events = await EventStore(session).list_for_run(result.run.id)
+    failures = [event for event in events if event.event_type is EventType.TOOL_FAILED]
+    assert len(failures) == 1
+    assert isinstance(failures[0].payload, ErrorPayload)
+    assert failures[0].payload.code == "workspace_path_type_error"
+    assert events[-1].event_type is EventType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_second_directory_read_type_error_fails_without_another_correction(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "tests"},
+                    tool_call_id="directory-read-1",
+                ),
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "tests"},
+                    tool_call_id="directory-read-2",
+                ),
+            )
+        ),
+        tool_names=("workspace.read",),
+    )
+    try:
+        with pytest.raises(WorkspacePathTypeError):
+            await service.run(
+                RunRequest(
+                    prompt="inspect tests",
+                    workspace=tmp_path,
+                    lease=CapabilityLease(filesystem_read=(".",)),
+                )
+            )
+    finally:
+        await providers.aclose()
+
+
+@pytest.mark.asyncio
+async def test_second_relative_lease_mismatch_is_not_retried(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "denied.txt").write_text("denied", encoding="utf-8")
+    service, providers = _runtime(
+        database,
+        FakeScript(
+            steps=(
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "docs/denied.txt"},
+                    tool_call_id="lease-mismatch-1",
+                ),
+                FakeToolCallStep(
+                    tool_name="workspace.read",
+                    arguments={"path": "docs/denied.txt"},
+                    tool_call_id="lease-mismatch-2",
+                ),
+            )
+        ),
+        tool_names=("workspace.read",),
+    )
+    try:
+        with pytest.raises(WorkspaceLeaseMismatchError):
+            await service.run(
+                RunRequest(
+                    prompt="read a leased file",
+                    workspace=tmp_path,
+                    lease=CapabilityLease(filesystem_read=("src",)),
+                )
+            )
+    finally:
+        await providers.aclose()
 
 
 @pytest.mark.asyncio

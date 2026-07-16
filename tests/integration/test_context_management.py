@@ -109,7 +109,7 @@ async def test_large_tool_output_is_replaced_by_loadable_artifact(
     tmp_path: Path,
 ) -> None:
     artifacts = FileArtifactStore(database, tmp_path / "artifacts")
-    messages = [
+    messages: list[ModelMessage] = [
         ModelResponse(parts=[ToolCallPart("test.large", {}, "large-1")]),
         ModelRequest(parts=[ToolReturnPart("test.large", {"content": "x" * 2_000}, "large-1")]),
     ]
@@ -125,7 +125,43 @@ async def test_large_tool_output_is_replaced_by_loadable_artifact(
     restored = json.loads((await artifacts.load(reference)).decode())
 
     assert restored == {"content": "x" * 2_000}
+    assert content["tool_name"] == "test.large"
+    assert content["tool_call_id"] == "large-1"
+    assert content["content_type"] == "object"
+    assert content["top_level_keys"] == ["content"]
+    assert content["original_bytes"] == reference.size_bytes
+    assert len(str(content["preview"]).encode("utf-8")) <= 515
     assert PairSafeTrimmer(1, preserve_first=False).trim(compacted) == compacted
+
+
+@pytest.mark.asyncio
+async def test_artifact_summary_redacts_sensitive_preview(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    artifacts = FileArtifactStore(database, tmp_path / "artifacts")
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    "test.large",
+                    {"password": "do-not-show", "content": "x" * 2_000},
+                    "large-secret",
+                )
+            ]
+        )
+    ]
+
+    compacted = await ToolOutputCompactor(artifacts, max_inline_bytes=100).compact(messages)
+    request = compacted[0]
+    assert isinstance(request, ModelRequest)
+    part = request.parts[0]
+    assert isinstance(part, ToolReturnPart)
+    structured = part.structured_content()
+    assert isinstance(structured, dict)
+    preview = str(structured["preview"])
+    assert "do-not-show" not in preview
+    assert "[REDACTED]" in preview
 
 
 @pytest.mark.asyncio
